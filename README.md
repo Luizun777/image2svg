@@ -1,7 +1,14 @@
 # image2svg
 
+[![Despliegue](https://github.com/Luizun777/image2svg/actions/workflows/deploy.yml/badge.svg)](https://github.com/Luizun777/image2svg/actions/workflows/deploy.yml)
+[![Licencia: GPL-2.0](https://img.shields.io/github/license/Luizun777/image2svg)](LICENSE)
+
 Vectoriza imágenes raster (PNG, JPG, WebP, GIF o BMP) a SVG en el navegador y mide la fidelidad del resultado; la imagen
-no sale de tu equipo. Los "picos" (dientes de sierra) aparecen cuando el trazador sigue tal cual la escalera de píxeles del
+no sale de tu equipo.
+
+**Demo:** [luizun777.github.io/image2svg](https://luizun777.github.io/image2svg/)
+
+Los "picos" (dientes de sierra) aparecen cuando el trazador sigue tal cual la escalera de píxeles del
 borde. image2svg la elimina antes de trazar: reescala la imagen hasta 4× con un bicúbico sin sobreimpulso, la suaviza con un
 desenfoque gaussiano proporcional al reescalado y la binariza en el nivel del 50 % de cobertura, así Potrace recibe un borde
 continuo en lugar de escalones (la receta de `mkbitmap`). Después renderiza el SVG, lo compara con el original (SSIM, IoU,
@@ -74,7 +81,9 @@ Sin `BENCH=1` el bench se salta. Cada muestra necesita su suelo medido en la tab
 Los contratos entre módulos y las decisiones de implementación (con sus mediciones) están en `ARCHITECTURE.md`; el sistema
 visual, en `DESIGN.md`.
 
-## Despliegue en GitHub Pages
+## Despliegue
+
+### GitHub Pages (producción)
 
 1. Publica el repositorio en GitHub con el nombre `image2svg`. La app se sirve bajo `/image2svg/`; si el repositorio se llama
    de otra forma, cambia `base` en `vite.config.ts`.
@@ -83,6 +92,16 @@ visual, en `DESIGN.md`.
    También se puede lanzar a mano desde la pestaña **Actions** (workflow_dispatch).
 
 La página queda en `https://<usuario>.github.io/image2svg/`.
+
+### Vercel (vista previa opcional)
+
+`vercel.json` fuerza `vite build --base=/`, porque Vercel sirve desde la raíz del dominio en vez de `/image2svg/`. No
+afecta al despliegue en GitHub Pages.
+
+```bash
+npx vercel deploy --temporary --yes   # vista previa anónima, caduca en 60 min si no se reclama
+npx vercel login && npx vercel --prod # despliegue permanente en tu cuenta
+```
 
 ## Licencias
 
