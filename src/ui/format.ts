@@ -103,6 +103,7 @@ export const MODE_LABEL: Record<Mode, string> = {
   auto: 'Auto',
   lines: 'Líneas/logo',
   flat: 'Color plano',
+  gradient: 'Degradados',
   pixel: 'Píxel exacto',
 };
 

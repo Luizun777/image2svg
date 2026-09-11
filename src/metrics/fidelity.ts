@@ -30,7 +30,7 @@ function clamp01(v: number): number {
  * Both images composited on `background` -> luma. ROI = inkBBox of the original luma.
  * SSIM and MAE on gaussianBlur(σ = 0.8); pctDiff16/32 on the composited RGB.
  * IoU: lines -> binary masks of the UNBLURRED lumas at thresholdNorm ?? Otsu(original) / 255;
- * flat/pixel -> 1 - pctDiff16. fidelity = clamp01(0.6 * ssim + 0.4 * iou).
+ * flat/gradient/pixel (colour, not shape) -> 1 - pctDiff16. fidelity = clamp01(0.6 * ssim + 0.4 * iou).
  * Throws when the two images differ in size.
  */
 export function computeMetrics(inp: FidelityInput): Metrics {

@@ -165,7 +165,7 @@ function harness(detected: ConcreteMode): {
   const render = (): void => {
     const mode = effectiveMode(ui, detected);
     const list = withBakedCheckerboard(others, BOARD, ui.bakedBackground ?? 'auto', mode);
-    const ctx = { params: ui, mode, engines: { potrace: true, vtracer: true }, resolvedUpscale: 2 };
+    const ctx = { params: ui, mode, engines: { potrace: true, vtracer: true }, resolvedUpscale: 2, gradientCandidate: false };
     view.set(list.map((warning) => ({ warning, action: warningAction(warning, ctx) })));
   };
   // Like app.ts: the action changes the params and the banners are refreshed synchronously.

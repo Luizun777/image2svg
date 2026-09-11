@@ -59,6 +59,7 @@ function contextShowing(id: string): ControlContext {
     ctx({ mode: 'lines' }),
     ctx({ mode: 'flat' }),
     ctx({ mode: 'pixel' }),
+    ctx({ mode: 'gradient' }),
     ctx({ mode: 'flat', params: { engine: 'vtracer' } }),
     ctx({ mode: 'flat', bakedBackground: BOARD }),
   ];
@@ -79,7 +80,7 @@ describe('schema integrity', () => {
   });
 
   it('keeps every mode default inside the slider range', () => {
-    const modes: ConcreteMode[] = ['lines', 'flat', 'pixel'];
+    const modes: ConcreteMode[] = ['lines', 'flat', 'gradient', 'pixel'];
     for (const mode of modes) {
       for (const c of CONTROLS) {
         if (c.kind !== 'slider') continue;
@@ -148,6 +149,60 @@ describe('visibility rules', () => {
     expect(ids(ctx({ mode: 'pixel' }))).toEqual(['mode', 'gridScale', 'optimize']);
   });
 
+  it('gradient: no palette or line controls; layering shown as in flat, cutout by default', () => {
+    const shown = ids(ctx({ mode: 'gradient' }));
+    for (const id of ['mode', 'engine', 'upscale', 'blurK', 'background', 'layering', 'optimize']) expect(shown).toContain(id);
+    for (const id of ['colors', 'exactPalette', 'thresholdOffset', 'invert', 'alphaMode', 'gridScale']) {
+      expect(shown).not.toContain(id);
+    }
+    expect(ids(ctx({ mode: 'lines' }))).not.toContain('layering');
+    const layering = controlById('layering') as SegmentedControl;
+    expect(layering.get(ctx({ mode: 'gradient' }))).toBe('cutout');
+    expect(layering.get(ctx({ mode: 'flat' }))).toBe('stacked');
+  });
+
+  it('gradient + Potrace: exact controls in main and advanced', () => {
+    const g = ctx({ mode: 'gradient' });
+    expect(ids(g, 'main')).toEqual(['mode', 'engine', 'alphamax', 'regionDetail', 'maxStops', 'radialGradients']);
+    expect(ids(g, 'advanced')).toEqual(['upscale', 'blurK', 'opttolerance', 'turdsize', 'background', 'layering', 'optimize']);
+  });
+
+  it('gradient + VTracer: exact controls in main and advanced', () => {
+    const g = ctx({ mode: 'gradient', params: { engine: 'vtracer' } });
+    expect(ids(g, 'main')).toEqual(['mode', 'engine', 'regionDetail', 'maxStops', 'radialGradients']);
+    expect(ids(g, 'advanced')).toEqual([
+      'upscale',
+      'blurK',
+      'background',
+      'layering',
+      'vtCornerThreshold',
+      'vtLengthThreshold',
+      'vtMaxIterations',
+      'vtSpliceThreshold',
+      'vtFilterSpeckle',
+      'vtPathPrecision',
+      'optimize',
+    ]);
+  });
+
+  it('shows the gradient controls only in gradient mode', () => {
+    for (const mode of ['lines', 'flat', 'pixel'] as const) {
+      for (const id of ['regionDetail', 'maxStops', 'radialGradients']) {
+        expect(ids(ctx({ mode })), `${mode}/${id}`).not.toContain(id);
+        expect(ids(ctx({ mode, params: { engine: 'vtracer' } })), `${mode}/${id}`).not.toContain(id);
+      }
+    }
+  });
+
+  it('notes the cutout default of Capas in gradient mode only', () => {
+    const layering = controlById('layering') as SegmentedControl;
+    const note = 'Recortadas por defecto: cada forma con su propio degradado, editable.';
+    expect(layering.note?.(ctx({ mode: 'gradient' }))).toBe(note);
+    expect(layering.note?.(ctx({ mode: 'gradient', params: { layering: 'stacked' } }))).toBe(note);
+    expect(layering.note?.(ctx({ mode: 'flat' }))).toBeNull();
+    expect(note).not.toMatch(/[\n–—]/);
+  });
+
   it('main section of flat + Potrace', () => {
     expect(ids(ctx({ mode: 'flat' }), 'main')).toEqual(['mode', 'engine', 'alphamax', 'colors', 'exactPalette']);
   });
@@ -161,7 +216,7 @@ describe('visibility rules', () => {
   });
 
   it('shows the painted checkerboard setting only when one was detected, in every mode', () => {
-    for (const mode of ['lines', 'flat', 'pixel'] as const) {
+    for (const mode of ['lines', 'flat', 'gradient', 'pixel'] as const) {
       expect(ids(ctx({ mode })), mode).not.toContain('bakedBackground');
       expect(ids(ctx({ mode, bakedBackground: BOARD }), 'advanced'), mode).toContain('bakedBackground');
     }
@@ -233,6 +288,10 @@ describe('value mapping', () => {
     expect(mode.set({}, 'nope')).toEqual({ mode: 'auto' });
     expect(mode.note?.(ctx({ mode: 'flat' }))).toBe('Detectado: Color plano');
     expect(mode.note?.(ctx({ mode: 'flat', params: { mode: 'flat' } }))).toBeNull();
+    expect(mode.options.map((o) => o.value)).toEqual(['auto', 'lines', 'flat', 'gradient', 'pixel']);
+    expect(mode.options.find((o) => o.value === 'gradient')?.label).toBe('Degradados');
+    expect(mode.set({}, 'gradient')).toEqual({ mode: 'gradient' });
+    expect(mode.note?.(ctx({ mode: 'gradient' }))).toBe('Detectado: Degradados');
 
     const bg = controlById('background') as SelectControl;
     expect(bg.set({ background: 'auto' }, 'custom')).toEqual({ background: { rgb: [255, 255, 255] } });
@@ -250,6 +309,41 @@ describe('value mapping', () => {
     expect(formatControlValue(controlById('engine')!, ctx())).toBe('Potrace');
     expect(formatControlValue(controlById('optimize')!, ctx({ params: { optimize: true } }))).toBe('sí');
     expect(DEFAULTS.lines.alphamax).toBe(1);
+  });
+
+  it('defines the gradient controls: ranges, labels, hints, defaults and value mapping', () => {
+    const detail = slider('regionDetail');
+    expect([detail.label, detail.section, detail.group, detail.param]).toEqual(['Detalle de regiones', 'main', 'trace', 'regionDetail']);
+    expect([detail.min, detail.max, detail.step, detail.decimals]).toEqual([0.5, 2, 0.1, 1]);
+    expect([detail.minLabel, detail.maxLabel, detail.auto]).toEqual(['Menos regiones', 'Más regiones', undefined]);
+    expect(detail.hint).toBe('Cuánto separa dos zonas de color parecido: más alto encuentra más formas.');
+
+    const stops = slider('maxStops');
+    expect([stops.label, stops.section, stops.group, stops.param]).toEqual(['Paradas máximas', 'main', 'trace', 'maxStops']);
+    expect([stops.min, stops.max, stops.step, stops.decimals]).toEqual([2, 8, 1, 0]);
+    expect(stops.hint).toBe('Número máximo de colores en cada degradado.');
+
+    const radial = controlById('radialGradients');
+    if (radial?.kind !== 'toggle') throw new Error('radialGradients is not a toggle');
+    expect([radial.label, radial.section, radial.group, radial.param]).toEqual(['Degradados radiales', 'main', 'trace', 'radialGradients']);
+    expect(radial.hint).toBe('Permite degradados circulares además de los lineales.');
+
+    const g = ctx({ mode: 'gradient' });
+    expect([detail.get(g), stops.get(g), radial.get(g)]).toEqual([
+      DEFAULTS.gradient.regionDetail,
+      DEFAULTS.gradient.maxStops,
+      DEFAULTS.gradient.radialGradients,
+    ]);
+    expect([detail.get(g), stops.get(g), radial.get(g)]).toEqual([1, 8, true]);
+    const frozen: TraceParams = Object.freeze({ mode: 'gradient' });
+    expect(detail.set(frozen, 1.5)).toEqual({ mode: 'gradient', regionDetail: 1.5 });
+    expect(stops.set(frozen, 4)).toEqual({ mode: 'gradient', maxStops: 4 });
+    expect(radial.set(frozen, false)).toEqual({ mode: 'gradient', radialGradients: false });
+    expect(radial.get({ ...g, params: { radialGradients: false } })).toBe(false);
+    expect(formatSliderValue(detail, 1.5)).toBe('1,5');
+    expect(formatSliderValue(stops, 4)).toBe('4');
+    expect(formatControlValue(radial, g)).toBe('sí');
+    for (const c of [detail, stops, radial]) expect(`${c.label} ${c.hint} ${detail.minLabel} ${detail.maxLabel}`).not.toMatch(/[\n–—]/);
   });
 
   it('computes the filled share of the track', () => {

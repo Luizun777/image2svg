@@ -5,7 +5,8 @@
  * same geometry can be rendered as a 1x anti-aliased image (`coverage`) and as an exact binary
  * mask at any integer upscale factor (`maskAt(U)`, pixel-centre test at U resolution).
  */
-import type { BinaryMask, LabelMap, RGB, RasterImage } from '../types';
+import type { BinaryMask, Fill, LabelMap, LinearGradient, RadialGradient, RegionMap, RGB, RasterImage } from '../types';
+import { evaluateFill } from '../core/fillEval';
 
 /** Signed distance: negative inside the shape, positive outside, in (1x) pixel units. */
 export type Sdf = (x: number, y: number) => number;
@@ -658,4 +659,388 @@ export function chessboardGraphic(
     }
   }
   return { image: { data, width: size, height: size }, board: { data: board, width: size, height: size } };
+}
+
+// ---------------------------------------------------------------------------------------------
+// Gradient fixtures (gradient mode): shapes painted with solid, linear and radial fills
+// ---------------------------------------------------------------------------------------------
+
+/** A shape of a gradient fixture: its geometry, its ground-truth fill and its id in the labels. */
+export interface GradientShape {
+  /** Negative inside, in 1x pixel units. */
+  sdf: Sdf;
+  /** Ground truth in 1x continuous coordinates: pixel (x, y) is painted with the fill at (x + 0.5, y + 0.5). */
+  fill: Fill;
+  /** Region id in the fixture's labels (0 is the background). */
+  label: number;
+}
+
+/** Pixel box [x0, x1) × [y0, y1). */
+interface PixelBox {
+  x0: number;
+  y0: number;
+  x1: number;
+  y1: number;
+}
+
+function boxAround(xs: readonly number[], ys: readonly number[], pad: number): PixelBox {
+  return {
+    x0: Math.floor(Math.min(...xs) - pad),
+    y0: Math.floor(Math.min(...ys) - pad),
+    x1: Math.ceil(Math.max(...xs) + pad) + 1,
+    y1: Math.ceil(Math.max(...ys) + pad) + 1,
+  };
+}
+
+function boxesOverlap(a: PixelBox, b: PixelBox): boolean {
+  return a.x0 < b.x1 && b.x0 < a.x1 && a.y0 < b.y1 && b.y0 < a.y1;
+}
+
+/**
+ * coverage() of `sdf` restricted to `box` on a size×size grid (0 outside the box): the square crop at
+ * the box origin is rendered by coverage() on the translated sdf. Subsample positions are the same
+ * dyadic numbers as on the full grid, so inside the box the values equal coverage(size, sdf).
+ */
+function coverageInBox(size: number, sdf: Sdf, box: PixelBox, ss = 8): Float32Array {
+  const out = new Float32Array(size * size);
+  const x0 = Math.max(0, box.x0);
+  const y0 = Math.max(0, box.y0);
+  const x1 = Math.min(size, box.x1);
+  const y1 = Math.min(size, box.y1);
+  if (x1 <= x0 || y1 <= y0) return out;
+  const side = Math.max(x1 - x0, y1 - y0);
+  const local = coverage(side, (x, y) => sdf(x + x0, y + y0), ss);
+  for (let y = y0; y < y1; y++) {
+    for (let x = x0; x < x1; x++) out[y * size + x] = local[(y - y0) * side + (x - x0)];
+  }
+  return out;
+}
+
+interface PaintedShape {
+  sdf: Sdf;
+  fill: Fill;
+  /** Every pixel the shape touches. */
+  box: PixelBox;
+}
+
+/**
+ * Paints `shapes` in order over an opaque `background` without conflation: the effective coverage of a
+ * shape is the share of the 8×8 subsamples of a pixel whose topmost shape it is (coverage() of the shape
+ * minus every later shape), and the background takes the rest, so a side shared by two shapes blends
+ * them directly (no background seam). Colour = sum of effective coverage × the shape's fill evaluated
+ * at the pixel centre (x + 0.5, y + 0.5), plus the background share, rounded to nearest.
+ * labels: 0 background, k + 1 for shapes[k], by maximum effective coverage (ties → the later one).
+ */
+function paintShapes(
+  size: number,
+  shapes: readonly PaintedShape[],
+  background: RGB,
+): { image: RasterImage; labels: RegionMap } {
+  const n = size * size;
+  const eff = shapes.map((shape, k) => {
+    const later: Sdf[] = [];
+    for (let j = k + 1; j < shapes.length; j++) if (boxesOverlap(shape.box, shapes[j].box)) later.push(shapes[j].sdf);
+    // Sign-only sdf of "inside this shape and outside every later one": coverage() only reads the sign.
+    const topmost: Sdf =
+      later.length === 0
+        ? shape.sdf
+        : (x, y) => {
+            const d = shape.sdf(x, y);
+            if (d >= 0) return d;
+            for (let j = 0; j < later.length; j++) if (later[j](x, y) < 0) return 1;
+            return d;
+          };
+    return coverageInBox(size, topmost, shape.box);
+  });
+  const data = new Uint8ClampedArray(n * 4);
+  const labels = new Int32Array(n);
+  const c: RGB = [0, 0, 0];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const p = y * size + x;
+      let r = 0;
+      let g = 0;
+      let b = 0;
+      let rest = 1;
+      for (let k = 0; k < shapes.length; k++) {
+        const e = eff[k][p];
+        if (e === 0) continue;
+        evaluateFill(shapes[k].fill, x + 0.5, y + 0.5, c);
+        r += e * c[0];
+        g += e * c[1];
+        b += e * c[2];
+        rest -= e;
+      }
+      if (rest < 0) rest = 0;
+      let best = rest;
+      let label = 0;
+      for (let k = 0; k < shapes.length; k++) {
+        const e = eff[k][p];
+        if (e > 0 && e >= best) {
+          best = e;
+          label = k + 1;
+        }
+      }
+      const o = p * 4;
+      data[o] = Math.round(r + rest * background[0]);
+      data[o + 1] = Math.round(g + rest * background[1]);
+      data[o + 2] = Math.round(b + rest * background[2]);
+      data[o + 3] = 255;
+      labels[p] = label;
+    }
+  }
+  return {
+    image: { data, width: size, height: size },
+    labels: { data: labels, width: size, height: size, count: shapes.length + 1 },
+  };
+}
+
+const DEG = Math.PI / 180;
+
+/** Unit vector at `deg` degrees counter-clockwise on screen from +x (y grows downwards): (cos, -sin). */
+function screenDir(deg: number): [number, number] {
+  return [Math.cos(deg * DEG), -Math.sin(deg * DEG)];
+}
+
+const FEATHER_SHADOW: RGB = [0x20, 0x22, 0x2a];
+/** Base → tip colours of feathers 1..8; 3 and 4 are the blue / purple pair that touches. */
+const FEATHER_COLORS: ReadonlyArray<readonly [RGB, RGB]> = [
+  [[0xff, 0x6a, 0x00], [0xff, 0xd2, 0x3f]], // orange → yellow
+  [[0xe8, 0x17, 0x5d], [0xff, 0x8c, 0x42]], // raspberry → orange
+  [[0x20, 0x40, 0xd0], [0x80, 0x30, 0xc0]], // blue → purple
+  [[0x80, 0x30, 0xc0], [0x20, 0x40, 0xd0]], // purple → blue
+  [[0x00, 0xa6, 0xa6], [0x9b, 0xe1, 0x5d]], // teal → light green
+  [[0x1e, 0x7f, 0xcb], [0x56, 0xcc, 0xf2]], // blue → sky blue
+  [[0xc2, 0x18, 0x5b], [0xf0, 0x62, 0x92]], // dark pink → pink
+  [[0x2e, 0x7d, 0x32], [0xc0, 0xca, 0x33]], // green → lime
+];
+const FEATHER_HUB: readonly [number, number] = [126, 190];
+/** Distance from the hub to a feather's base apex, px (size 256). */
+const FEATHER_BASE_RADIUS = 18;
+/** Half width of the base and tip edges, px. */
+const FEATHER_HALF_EDGE = 1.5;
+/** Length of the sides from the base edge to the widest points, px. */
+const FEATHER_SIDE = 32;
+/** Base apex → tip distance before the seeded jitter (× 0.94..1), px. */
+const FEATHER_LENGTH = 104;
+/** Angle of the sides to the axis, degrees: half the 22.5° spacing, so facing sides are parallel. */
+const FEATHER_SIDE_ANGLE = 11.25;
+
+/**
+ * Logo-like fan of 8 feathers, each painted with a 2-stop linear gradient along its own long axis, and a
+ * flat dark disc (the "shadow") drawn last over feathers 6 and 7, on white: the gradient-mode test bed
+ * where every shape is one region with a known fill. Deterministic per seed; the seed only jitters the
+ * tip lengths. Coordinates for size 256, everything scaled by size/256; directions dir(a) = (cos a,
+ * -sin a), i.e. a degrees counter-clockwise on screen from +x:
+ *
+ *   hub H = (126, 190). Feather i = 1..8 has axis angle a_i = 7° + 22.5°·(i - 1) and is a convex
+ *   hexagon around its axis:
+ *     base apex B_i = H + 18·dir(a_i); base edge B_i ± 1.5·dir(a_i ± 90°);
+ *     sides from the base edge ends at a_i ± 11.25° for 32 px, to the widest points S± (half width 7.74);
+ *     tip T_i = B_i + L_i·dir(a_i), L_i = 104·(0.94 + 0.06·u_i) with u_i the i-th mulberry32(seed) draw;
+ *     tip edge T_i ± 1.5·dir(a_i ± 90°) (blunt ends: sharp apexes left sub-pixel label slivers).
+ *   Facing sides of neighbours are parallel (both at a_i + 11.25°) with a background gap of 4.1 px
+ *   (7.5 px next to the 3/4 pair). Feathers 3 and 4 instead touch: their base apexes sit 1.47 px
+ *   (1.5·cos 11.25°) on either side of P = H + 18·dir(63.25°), across the line through P at 63.25°, so
+ *   their facing sides lie on that line and coincide from the base edge to S (32 px, t <= 0.33 of each
+ *   ramp); past S they part with a background wedge. Blue → purple against purple → blue differ there
+ *   by (1 - 2t)·96 levels of red, at least 33 (measured 33.5..36.1 on seeds 1..8, 44 contact pairs):
+ *   the contact never reaches the mid-ramp where the two colours are equal.
+ *   Gradient of feather i: (x1, y1) = B_i, first colour at 0 → (x2, y2) = T_i, second colour at 1
+ *   (the middles of the base and tip edges).
+ *   Shadow: disc of r 11 centred at H + 52·dir(130.75°) (the bisector of feathers 6 and 7), #20222a,
+ *   biting about 7 px into each of them at their widest part without splitting either.
+ *
+ * Painting and labels as in paintShapes (no conflation; label = maximum effective coverage, ties → the
+ * later shape): labels 0 background (solid `background`), 1..8 the feathers, 9 the shadow (count 10);
+ * shapes[k].label = k + 1. At 128 and 256 px every label is a single 4-connected piece; at 512 px the
+ * argmax leaves a background speck in the thin wedge where feathers 3 and 4 part.
+ */
+export function gradientFeathers(
+  size = 256,
+  seed = 1,
+): { image: RasterImage; shapes: GradientShape[]; labels: RegionMap; background: RGB } {
+  assertNonNegInt('size', size);
+  const s = size / 256;
+  const rand = mulberry32(seed);
+  const hx = FEATHER_HUB[0] * s;
+  const hy = FEATHER_HUB[1] * s;
+  const rho = FEATHER_BASE_RADIUS * s;
+  const half = FEATHER_HALF_EDGE * s;
+  const side = FEATHER_SIDE * s;
+  const painted: PaintedShape[] = [];
+  const shapes: GradientShape[] = [];
+  for (let i = 1; i <= 8; i++) {
+    const a = 7 + 22.5 * (i - 1);
+    const axis = screenDir(a);
+    let bx: number;
+    let by: number;
+    if (i === 3 || i === 4) {
+      const shared = 7 + 22.5 * 2.5; // 63.25°: the line both facing sides lie on
+      const p = screenDir(shared);
+      const normal = screenDir(shared + 90);
+      const off = (i === 3 ? -1 : 1) * half * Math.cos(FEATHER_SIDE_ANGLE * DEG);
+      bx = hx + rho * p[0] + off * normal[0];
+      by = hy + rho * p[1] + off * normal[1];
+    } else {
+      bx = hx + rho * axis[0];
+      by = hy + rho * axis[1];
+    }
+    const length = FEATHER_LENGTH * s * (0.94 + 0.06 * rand());
+    const nMinus = screenDir(a - 90);
+    const nPlus = screenDir(a + 90);
+    const sideMinus = screenDir(a - FEATHER_SIDE_ANGLE);
+    const sidePlus = screenDir(a + FEATHER_SIDE_ANGLE);
+    const tx = bx + length * axis[0];
+    const ty = by + length * axis[1];
+    const bmx = bx + half * nMinus[0];
+    const bmy = by + half * nMinus[1];
+    const bpx = bx + half * nPlus[0];
+    const bpy = by + half * nPlus[1];
+    const vx = [bmx, bmx + side * sideMinus[0], tx + half * nMinus[0], tx + half * nPlus[0], bpx + side * sidePlus[0], bpx];
+    const vy = [bmy, bmy + side * sideMinus[1], ty + half * nMinus[1], ty + half * nPlus[1], bpy + side * sidePlus[1], bpy];
+    const sdf = polygonSdf(Float64Array.from(vx), Float64Array.from(vy));
+    const [first, second] = FEATHER_COLORS[i - 1];
+    const fill: LinearGradient = {
+      kind: 'linear',
+      x1: bx,
+      y1: by,
+      x2: tx,
+      y2: ty,
+      stops: [
+        { offset: 0, color: [first[0], first[1], first[2]] },
+        { offset: 1, color: [second[0], second[1], second[2]] },
+      ],
+    };
+    shapes.push({ sdf, fill, label: i });
+    painted.push({ sdf, fill, box: boxAround(vx, vy, 1) });
+  }
+  const toward = screenDir(130.75);
+  const cx = hx + 52 * s * toward[0];
+  const cy = hy + 52 * s * toward[1];
+  const r = 11 * s;
+  const shadowSdf = circleSdf(cx, cy, r);
+  const shadow: Fill = { kind: 'solid', color: [FEATHER_SHADOW[0], FEATHER_SHADOW[1], FEATHER_SHADOW[2]] };
+  shapes.push({ sdf: shadowSdf, fill: shadow, label: 9 });
+  painted.push({ sdf: shadowSdf, fill: shadow, box: boxAround([cx - r, cx + r], [cy - r, cy + r], 1) });
+  const { image, labels } = paintShapes(size, painted, WHITE);
+  return { image, shapes, labels, background: [WHITE[0], WHITE[1], WHITE[2]] };
+}
+
+const RADIAL_STOPS: ReadonlyArray<readonly [number, RGB]> = [
+  [0, [0xff, 0xe0, 0x8a]],
+  [0.5, [0xff, 0x7a, 0x3d]],
+  [1, [0x7a, 0x1f, 0xa2]],
+];
+
+/**
+ * Disc of radius 48 centred at (60, 66) painted with a 3-stop radial gradient of the same centre and
+ * r 48 (#ffe08a at 0, #ff7a3d at 0.5, #7a1fa2 at 1), anti-aliased on white as in paintShapes.
+ * Coordinates for size 128, scaled by size/128; `fill` in 1x continuous coordinates.
+ */
+export function radialDisc(size = 128): { image: RasterImage; fill: RadialGradient; sdf: Sdf } {
+  assertNonNegInt('size', size);
+  const s = size / 128;
+  const cx = 60 * s;
+  const cy = 66 * s;
+  const r = 48 * s;
+  const sdf = circleSdf(cx, cy, r);
+  const fill: RadialGradient = {
+    kind: 'radial',
+    cx,
+    cy,
+    r,
+    stops: RADIAL_STOPS.map(([offset, c]) => ({ offset, color: [c[0], c[1], c[2]] })),
+  };
+  const { image } = paintShapes(size, [{ sdf, fill, box: boxAround([cx - r, cx + r], [cy - r, cy + r], 1) }], WHITE);
+  return { image, fill, sdf };
+}
+
+const SWEEP_STOPS: ReadonlyArray<readonly [number, RGB]> = [
+  [0, [0xfe, 0xda, 0x75]],
+  [0.3, [0xfa, 0x7e, 0x1e]],
+  [0.65, [0xd6, 0x29, 0x76]],
+  [1, [0x96, 0x2f, 0xbf]],
+];
+
+/**
+ * Rounded square (x and y in [16, 112], corner radius 20) painted with a 4-stop diagonal linear
+ * gradient in Instagram-like colours from the bottom-left (20, 108) to the top-right (108, 20): #feda75
+ * at 0, #fa7e1e at 0.3, #d62976 at 0.65, #962fbf at 1. Anti-aliased on white as in paintShapes;
+ * coordinates for size 128, scaled by size/128.
+ */
+export function diagonalSweep(size = 128): { image: RasterImage; fill: LinearGradient; sdf: Sdf } {
+  assertNonNegInt('size', size);
+  const s = size / 128;
+  const inner = boxSdf(64 * s, 64 * s, 28 * s, 28 * s);
+  const corner = 20 * s;
+  const sdf: Sdf = (x, y) => inner(x, y) - corner;
+  const fill: LinearGradient = {
+    kind: 'linear',
+    x1: 20 * s,
+    y1: 108 * s,
+    x2: 108 * s,
+    y2: 20 * s,
+    stops: SWEEP_STOPS.map(([offset, c]) => ({ offset, color: [c[0], c[1], c[2]] })),
+  };
+  const { image } = paintShapes(size, [{ sdf, fill, box: boxAround([16 * s, 112 * s], [16 * s, 112 * s], 1) }], WHITE);
+  return { image, fill, sdf };
+}
+
+/** #ed2b2b and #149e14: both have Rec.601 luma 0.299R + 0.587G + 0.114B = 101.006 exactly. */
+const HUE_RED: RGB = [0xed, 0x2b, 0x2b];
+const HUE_GREEN: RGB = [0x14, 0x9e, 0x14];
+
+/**
+ * Horizontal red → green ramp over the whole image at constant Rec.601 luma: #ed2b2b at x = 0 and
+ * #149e14 at x = size (luma 101.006 both, so every interpolated colour has it before rounding). Each
+ * pixel is the fill at its centre, rounded; no shape and no anti-aliasing.
+ */
+export function hueRamp(size = 96): { image: RasterImage; fill: LinearGradient } {
+  assertNonNegInt('size', size);
+  const fill: LinearGradient = {
+    kind: 'linear',
+    x1: 0,
+    y1: size / 2,
+    x2: size,
+    y2: size / 2,
+    stops: [
+      { offset: 0, color: [HUE_RED[0], HUE_RED[1], HUE_RED[2]] },
+      { offset: 1, color: [HUE_GREEN[0], HUE_GREEN[1], HUE_GREEN[2]] },
+    ],
+  };
+  const data = new Uint8ClampedArray(size * size * 4);
+  const c: RGB = [0, 0, 0];
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      evaluateFill(fill, x + 0.5, y + 0.5, c);
+      const o = (y * size + x) * 4;
+      data[o] = Math.round(c[0]);
+      data[o + 1] = Math.round(c[1]);
+      data[o + 2] = Math.round(c[2]);
+      data[o + 3] = 255;
+    }
+  }
+  return { image: { data, width: size, height: size }, fill };
+}
+
+/**
+ * Copy of `img` with seeded uniform integer noise in [-amp, amp] added to each RGB channel
+ * independently (clamped to 0..255); alpha untouched. Per channel the noise has sigma
+ * sqrt(amp·(amp + 1)/3) (2 for amp 3); on Rec.601 luma 0.669 times that (1.34 for amp 3).
+ */
+export function withNoise(img: RasterImage, amp = 3, seed = 1): RasterImage {
+  assertNonNegInt('amp', amp);
+  const rand = mulberry32(seed);
+  const src = img.data;
+  const out = new Uint8ClampedArray(src.length);
+  const span = 2 * amp + 1;
+  for (let o = 0; o < src.length; o += 4) {
+    for (let ch = 0; ch < 3; ch++) {
+      const jitter = amp > 0 ? Math.floor(rand() * span) - amp : 0;
+      out[o + ch] = src[o + ch] + jitter;
+    }
+    out[o + 3] = src[o + 3];
+  }
+  return { data: out, width: img.width, height: img.height };
 }

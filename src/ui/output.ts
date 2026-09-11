@@ -3,6 +3,8 @@
  * user downloads or copies. DOM-free; SVGO is loaded lazily (its own chunk) the first time.
  */
 
+import type { Config } from 'svgo/browser';
+
 const DATA_URL_PREFIX = 'data:image/svg+xml;charset=utf-8,';
 
 /** `data:image/svg+xml;charset=utf-8,…` with the markup percent-encoded (safe for `#`, `%`, quotes). */
@@ -28,12 +30,16 @@ export function svgFileName(sourceName: string): string {
 }
 
 /**
- * SVGO configuration for the exported file. `mergePaths` stays off so every colour layer keeps
- * its own path (editors rely on it). SVGO 4 no longer runs `removeViewBox` in preset-default,
- * so the viewBox survives without an override (overriding a plugin outside the preset only logs
- * a warning). Coordinates keep 4 decimals.
+ * SVGO configuration for the exported file (the only one: optimizeSvg passes it as is).
+ * `mergePaths` stays off so every colour layer keeps its own path (editors rely on it).
+ * `cleanupIds` stays off so the gradient ids g<h>-0, g<h>-1… (unique per document, see assembleSvg) keep
+ * their names and their url(#…) references (SVGO would shorten them to a, b…, the same in every file);
+ * `removeUselessDefs` keeps its default, since it
+ * only drops <defs> children without an id and every emitted gradient has one. SVGO 4 no longer
+ * runs `removeViewBox` in preset-default, so the viewBox survives without an override
+ * (overriding a plugin outside the preset only logs a warning). Coordinates keep 4 decimals.
  */
-export const SVGO_CONFIG = {
+export const SVGO_CONFIG: Config = {
   multipass: false,
   floatPrecision: 4,
   plugins: [
@@ -41,11 +47,11 @@ export const SVGO_CONFIG = {
       name: 'preset-default',
       params: {
         floatPrecision: 4,
-        overrides: { mergePaths: false },
+        overrides: { mergePaths: false, cleanupIds: false },
       },
     },
   ],
-} as const;
+};
 
 type SvgoModule = typeof import('svgo/browser');
 let svgoPromise: Promise<SvgoModule> | null = null;
@@ -70,16 +76,7 @@ export async function optimizeSvg(svg: string): Promise<string> {
     throw new Error('No se pudo cargar el optimizador SVGO.');
   }
   try {
-    return mod.optimize(svg, {
-      multipass: SVGO_CONFIG.multipass,
-      floatPrecision: SVGO_CONFIG.floatPrecision,
-      plugins: [
-        {
-          name: 'preset-default',
-          params: { floatPrecision: 4, overrides: { mergePaths: false } },
-        },
-      ],
-    }).data;
+    return mod.optimize(svg, SVGO_CONFIG).data;
   } catch (err) {
     const detail = err instanceof Error ? `: ${err.message}` : '';
     throw new Error(`SVGO no pudo optimizar el SVG${detail}`);

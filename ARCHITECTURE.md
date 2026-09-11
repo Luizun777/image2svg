@@ -13,12 +13,24 @@ documento fija **los contratos** entre módulos para que se puedan implementar e
   `paletteColors`, `offPaletteRatio`, `quantError` y `twoToneOffRatio`, ver classify; `WarningCode` ganó
   `'empty-trace'`, ver pipeline; transparencia falsa: `SourceInfo` ganó `bakedBackground`, `TraceParams` y
   `ResolvedParams` ganaron `bakedBackground: 'auto' | 'keep'`, `WarningCode` ganó `'baked-checkerboard'` y hay un tipo
-  `BakedCheckerboard`, ver bakedBackground). Importar como
+  `BakedCheckerboard`, ver bakedBackground; modo Degradados (2026-09-11): `Mode` ganó `'gradient'`, tipos nuevos `GradientStop`,
+  `LinearGradient`, `RadialGradient`, `Gradient`, `SolidFill`, `Fill`, `RegionMap`, `Segmentation`, `RegionModel` y `GradientProbe`,
+  `Layer` ganó `gradient?`, `SourceInfo` ganó `gradientProbe`, `TraceParams` y `ResolvedParams` ganaron `regionDetail`, `maxStops` y
+  `radialGradients`, `WarningCode` ganó `'gradient-fallback'`; ver fillEval, regions, fillModel y "Degradados, fase 0"; la revisión de hallazgos
+  solo corrigió los comentarios de `Segmentation.core`, `GradientProbe.explained` y `SourceInfo.gradientProbe`, ver "Degradados, revisión de
+  hallazgos"). Importar como
   `import type { … } from '../types'`.
 - Imágenes: `RasterImage` (RGBA `Uint8ClampedArray`), `GrayImage` (`Float32Array` 0..255),
   `BinaryMask` (`Uint8Array` 0/1, **1 = tinta**), `LabelMap`.
 - Coordenadas de paths (`AbsPath`/`Seg`): absolutas, y hacia abajo, origen arriba-izquierda,
   en píxeles del espacio en que se trazó (reescalado). Números en `number`, sin redondeo hasta serializar.
+- Coordenadas de rellenos (modo Degradados; única implementación: `src/core/fillEval.ts`, que usan el ajuste, el refinado de
+  etiquetas, el rasterizador y el emisor SVG): continuas, el píxel (x, y) cubre [x, x+1) × [y, y+1) y su centro es (x + 0.5, y + 0.5).
+  Un relleno ajustado a 1× está en unidades 1×; el píxel U× (X, Y) tiene su centro en ((X + 0.5)/U, (Y + 0.5)/U) en unidades 1×, así
+  que un relleno 1× se emite en unidades del viewBox multiplicando sus coordenadas y `r` por U, sin desplazamiento (`scaleFill`).
+  `Layer.gradient` y `PreparedLayer.gradient` van en unidades del viewBox, como los paths. Semántica SVG 1.1 con
+  `gradientUnits="userSpaceOnUse"` y `spreadMethod` pad: t lineal = proyección sobre (x2 − x1, y2 − y1) / |d|², radial =
+  distancia al centro / r, recortado a [0, 1]; interpolación sRGB entre paradas; |d| = 0 o r = 0 pintan la última parada.
 - Determinismo: nada de `Math.random()` sin seed. Los tests usan imágenes sintéticas generadas
   por `src/dev/synth.ts`.
 - Estilo: ESM, `verbatimModuleSyntax` (usar `import type`), sin `any` salvo interop wasm,
@@ -92,6 +104,39 @@ export function hardEdgeRatio(img: GrayImage | RasterImage): number
 // niveles cualesquiera es duro; un tercer color real en una esquina de pixel art no está en ese segmento y no cuenta.
 export function thinStrokeRatio(mask: BinaryMask): number // 1 - countInk(erode1(mask)) / countInk(mask); 0 si no hay tinta
 export function detectGrid(img: RasterImage): number      // mayor k en [8,7,6,5,4,3,2] tal que w%k==0, h%k==0 y TODOS los bloques k×k son de color constante (RGBA exacto); 1 si ninguno
+// ---- modo Degradados (fase 1) ----
+export interface EdgeMaps { sobel: GrayImage; laplacian: GrayImage }
+export function rgbEdgeMaps(img: RasterImage, withAlpha = false): EdgeMaps
+// Por canal R, G y B (y alpha con withAlpha; si no, alpha ignorado), bordes replicados, y máximo de los canales: sobel = sqrt(gx² + gy²) con
+// cada componente ÷4 (escalón 0→255 = 255, como sobelMagnitude); laplacian = |convolución con [[1,1,1],[1,−8,1],[1,1,1]]| ÷ 8 (0 en un
+// degradado lineal, pico en un borde AA). Mismo tamaño que img.
+export function hysteresis(mag: Float32Array, width: number, height: number, lo: number, hi: number): BinaryMask
+// 1 = mag > hi, o mag > lo y 8-conectado (a través de píxeles > lo) a alguno > hi. Pila Int32Array, sin recursión.
+export interface EdgeThresholds { lapHi: number; lapLo: number; sobHi: number; sobLo: number }
+export function edgeThresholds(sigma: number, regionDetail: number): EdgeThresholds
+// lapHi = max(6, 1.8·4σ) / regionDetail; lapLo = 0.45·lapHi; sobHi = max(24, 9σ) / regionDetail; sobLo = 0.4·sobHi
+// (σ = immerkaerSigma). Máscara de bordes = hysteresis(laplacian, lapLo, lapHi) ∪ hysteresis(gateSobel(sobel, laplacian), sobLo, sobHi).
+export const SOBEL_GATE_RADIUS = 1, SOBEL_CONTRAST_RADIUS = 2, SOBEL_SEED_CLEARANCE = 3
+export function gateSobel(sobel: Float32Array, laplacian: Float32Array, width: number, height: number, t: EdgeThresholds,
+  lapRadius = SOBEL_GATE_RADIUS, contrastRadius = SOBEL_CONTRAST_RADIUS): Float32Array
+// Revisión de hallazgos. Copia los píxeles ≤ sobLo y los > sobHi. Un píxel débil (sobLo < v ≤ sobHi): si v − (mínimo del Sobel a ≤ contrastRadius
+// px, Chebyshev) > sobLo (un escalón localizado) → +Infinity (semilla) cuando ningún píxel fuerte (Sobel > sobHi o laplaciano > lapHi) está a
+// ≤ SOBEL_SEED_CLEARANCE px, o v si lo hay; si no, v cuando algún laplaciano > lapLo a ≤ lapRadius px (un pliegue o los lóbulos de un escalón);
+// si no, 0 (una rampa: mismo Sobel alrededor y laplaciano 0, ni siembra ni continúa la histéresis). Array nuevo; no muta.
+```
+
+### src/core/noise.ts (modo Degradados, fase 1)
+```ts
+export function immerkaerSigma(img: RasterImage): number
+// σ̂ del ruido en niveles 0..255 (Immerkær 1996) sobre la luma 0.299R + 0.587G + 0.114B SIN desenfocar:
+// σ = sqrt(π/2) · Σ|L ∗ N| / (6·n), N = [[1,−2,1],[−2,4,−2],[1,−2,1]], sumando solo píxeles interiores cuyo 3×3 es opaco (alpha ≥ 250)
+// y lejos de bordes fuertes: se excluye el píxel si algún píxel de su 3×3 tiene Sobel de luma (÷4, bordes replicados) > T =
+// max(EDGE_SOBEL_MIN 24, EDGE_SOBEL_PER_SIGMA 3 · σ_all), con σ_all la misma estimación sin exclusión (constantes privadas); n = píxeles
+// sumados. Si la exclusión no deja ningún píxel devuelve σ_all; 0 si no hay ningún interior con 3×3 opaco (imágenes < 3×3 incluidas).
+// Medido SIN exclusión de bordes (fase 0): limpios hueRamp 0.000, noisePhoto(256) 0.201, diagonalSweep 0.410, flatShapes3 0.480,
+// gradientFeathers 0.979, radialDisc 1.069; con withNoise(±3), semillas 1..3: gris plano y hueRamp 1.345..1.360, gradientFeathers
+// 1.710..1.720, flatShapes3 1.766..1.806. Ruido entero ±3 independiente por canal = σ 2 por canal y 0.669·2 = 1.337 en luma: sobre
+// contenido plano un estimador correcto da ≈ 1.34, por debajo del rango [1.4, 2.1] que el plan pide para "ruido ±3" (ver Decisiones).
 ```
 
 ### src/core/background.ts
@@ -122,6 +167,8 @@ export const DEFAULTS: Record<ConcreteMode, Required<Omit<TraceParams,'vtracer'|
 export const VTRACER_DEFAULTS: VtracerParams  // 60, 4, 10, 45, 4, 6, 16, 3
 export function resolveParams(params: TraceParams, source: { width: number; height: number }, modeIfAuto?: ConcreteMode): ResolvedParams
 // mode 'auto' sin modeIfAuto → 'lines'. Clamps: alphamax [0,1.334], opttolerance [0.01,1], turdsize [0,100], blurK [0,1], thresholdOffset [-0.25,0.25], colors [2,32]. pixel: upscale 1, sigmaPx 0.
+// Degradados: regionDetail [0.5,2] (defecto 1), maxStops [2,8] entero (defecto 8), radialGradients true solo si es true (defecto true);
+// DEFAULTS.gradient = { ...base, layering: 'cutout' }. Los tres campos están en todos los modos (ModeDefaults los exige; PARAM_KEYS de la UI los recoge).
 ```
 
 ### src/core/palette.ts
@@ -176,6 +223,158 @@ export function pixelSvg(img: RasterImage, k: number, maxRects?: number, size?: 
 // Con > maxRects (default MAX_PIXEL_RECTS, contados antes) → { svg: '', rectCount } sin serializar
 ```
 
+### src/core/fillEval.ts (modo Degradados; convención de coordenadas en "Reglas globales")
+```ts
+export const DEGENERATE_EPS = 1e-6
+export const DEGENERATE_COLOR_SPAN = 1
+export function gradientT(g: Gradient, x: number, y: number): number
+// lineal ((x−x1)(x2−x1) + (y−y1)(y2−y1)) / |d|²; radial hypot(x−cx, y−cy) / r; recortado a [0, 1] (pad). |d| = 0 o r ≤ 0 → 1; NaN → 0.
+export function stopColorAt(stops: readonly GradientStop[], t: number, out: RGB): RGB
+// paradas no decrecientes; interpolación lineal sRGB entre offset_i ≤ t < offset_i+1; t ≤ primer offset → primer color; t ≥ último →
+// último color; con varias paradas en un offset, en ese t gana la posterior. Sin paradas → negro. Escribe y devuelve `out`.
+export function evaluateFill(f: Fill, x: number, y: number, out: RGB): RGB   // solid → su color; degradado → stopColorAt(stops, gradientT(g, x, y))
+export function scaleGradient(g: Gradient, s: number): Gradient              // sobrecargas Linear→Linear, Radial→Radial; coordenadas y r × s, paradas copiadas
+export function scaleFill(f: Fill, s: number): Fill                          // solid → copia
+export function gradientMeanColor(g: Gradient): RGB
+// ∫ de 0 a 1 de la interpolación de paradas (extremos constantes y trapecios), sin redondear: rampa 0→255 = 127.5. Layer.fill = su hex.
+export function isDegenerateGradient(g: Gradient): boolean
+// < 2 paradas, geometría no finita, |d| < DEGENERATE_EPS, r < DEGENERATE_EPS, o todas las paradas a ≤ DEGENERATE_COLOR_SPAN nivel en
+// cada canal → se trata como relleno plano (solid del color medio).
+export function normalizeStops(stops: readonly GradientStop[]): GradientStop[]
+// offsets recortados a [0, 1] (no finito → 0) y subidos a no decrecientes; colores recortados a [0, 255] (no finito → 0, sin redondear:
+// el hex del SVG redondea, ≤ 0.5 niveles); dos paradas en el mismo offset se conservan (parada dura: stopColorAt y SVG saltan del primer color
+// al segundo); de tres o más en un offset quedan la primera y la última (las de en medio nunca se ven). Objetos nuevos; no muta.
+```
+
+### src/core/regions.ts (modo Degradados, fase 2)
+```ts
+export const MAX_GRADIENT_REGIONS = 2000
+export const PREBLUR_SIGMA = 0.7      // gaussianBlurRaster antes de los mapas de bordes
+export const CORE_MIN_ALPHA = 128     // píxel núcleo: alpha ≥ 128 y no borde (con transparencia el alfa entra en los mapas de bordes)
+export const REGION_MIN_ALPHA = 128   // por debajo, región −1 (el mismo corte que el centinela transparente de flat)
+export const BAND_RINGS = 3           // anillos de growIntoBand (segmentRegions ya no la usa, ver Decisiones)
+export const NO_REGION = 0xffff       // etiqueta U× (Uint16Array) sin región
+export const ORPHAN_STEP_RATIO = 2, ORPHAN_RAY_LENGTH = 8, ORPHAN_MIN_AREA = 16, THIN_BLEND_RATIO = 0.5   // revisión de hallazgos
+export interface SegmentEdges { edge: BinaryMask; edgeShare: number; sigma: number; thresholds: EdgeThresholds }
+export function segmentEdges(img: RasterImage, opts: { regionDetail: number; sigma?: number }): SegmentEdges
+// La etapa de bordes de segmentRegions: sigma = opts.sigma ?? immerkaerSigma(img); preblur PREBLUR_SIGMA (premultiplicado, y con el canal alfa
+// en rgbEdgeMaps, si hay alpha < 255) → edgeThresholds(sigma, regionDetail) → hysteresis(laplacian) ∪ hysteresis(gateSobel(sobel, laplacian));
+// edgeShare = |edge ∧ alpha ≥ 128| / |alpha ≥ 128|. El pipeline decide aquí el fallback por bordes, antes de etiquetar.
+export function segmentRegions(img: RasterImage, opts: { regionDetail: number; sigma?: number; edges?: SegmentEdges }): Segmentation
+// edges = opts.edges ?? segmentEdges(img, opts) (del mismo tamaño) → core = alpha ≥ CORE_MIN_ALPHA ∧ ¬edge → labelComponents(core) → los píxeles con
+// alpha ≥ REGION_MIN_ALPHA sin región se rellenan POR COLOR (growByColour, privada: crecimiento con semillas sobre el RGB sin desenfocar,
+// prioridad |ΔR| + |ΔG| + |ΔB| con el 4-vecino etiquetado, cola de 766 cubetas FIFO por prioridad; el píxel toma el 4-vecino etiquetado de
+// color más parecido, empate → id menor; origin[p] = el píxel core del que partió su crecimiento) → huérfanos: un píxel crecido (no core) con
+// max canal |p − origin[p]| > ORPHAN_STEP_RATIO·sobHi cuyos 8 rayos (ORPHAN_RAY_LENGTH px, cortados por transparencia o el borde de la imagen)
+// encuentran algún píxel core y ningún par de colores de esos primeros píxeles core (un píxel consigo mismo incluido) deja un segmento a
+// ≤ ORPHAN_STEP_RATIO·sobHi de su color (un trazo no es mezcla de lo que lo rodea; un píxel AA entre dos regiones sí); los grupos 4-conexos
+// de huérfanos de ≥ ORPHAN_MIN_AREA px salen de su región y forman regiones nuevas (ids a continuación), los menores se quedan → los que no
+// alcanza ninguna región forman componentes 4-conexas nuevas (ids a continuación) → núcleo fino de las regiones nuevas (huérfanas y
+// sobrantes, sin núcleo por la máscara de bordes): sus píxeles que no son mezcla de sus dos vecinos elegibles en x ni en y (a ≤
+// THIN_BLEND_RATIO·sobHi del segmento entre ellos y a más de eso de ambos); una región donde todos lo son los toma todos → area y
+// regionAdjacency. No usa growIntoBand ni BAND_RINGS (medido en Decisiones, fases 1 y 2). Invariantes: regions.data[i] = −1 ⇔ alpha < 128;
+// todo píxel core tiene región; toda región tiene algún píxel core; edgeShare = el de edges; sigma = el usado.
+export function labelComponents(mask: BinaryMask): RegionMap
+// componentes 4-conexas de mask = 1 (union-find Int32Array); ids 0..count−1 en orden de su primer píxel en raster; −1 fuera de mask.
+export function growIntoBand(regions: RegionMap, eligible: BinaryMask, rings: number): RegionMap
+// No muta. En cada anillo, cada píxel eligible sin región con algún 4-vecino etiquetado (antes de ese anillo) toma la etiqueta más frecuente
+// entre sus 8 vecinos etiquetados (empate → id menor). Tras `rings` anillos, los eligible que sigan sin región forman componentes 4-conexas
+// nuevas (ids a continuación); count actualizado.
+export function regionAdjacency(regions: RegionMap): Int32Array[]  // [i] = ids 4-adyacentes a i, ascendentes, sin i ni repetidos
+export function mergeRegions(seg: Segmentation, pairs: ReadonlyArray<readonly [number, number]>): { seg: Segmentation; remap: Int32Array }
+// Aplica los pares [src, dst] en orden (union-find: [a,b],[b,c] → a y b en c). Ids nuevos compactos 0..count'−1 en orden del menor id
+// original de cada grupo; remap[idViejo] = idNuevo. regions, area y adjacency recalculados; edge, core, sigma y edgeShare iguales. No muta.
+export function regionOrder(seg: Segmentation): number[]
+// Orden pintor (atrás → delante), permutación de 0..count−1: área descendente (empate: id menor); después, toda región cuya adyacencia
+// es exactamente [a] y que no toca el borde de la imagen se pinta después de a (anillo alrededor de un disco: el disco después; un fondo que
+// solo toca un anillo no se mueve), cadenas resueltas; en un ciclo (dos regiones que solo se tocan entre sí, aisladas por transparencia) la
+// primera por área conserva su sitio.
+export function refineLabels(seg: Segmentation, fills: readonly Fill[], up: RasterImage, U: number): Uint16Array
+// Etiquetas de `up` (up.width × up.height). U = píxeles de up por píxel de seg (U·f si se segmentó en un proxy de factor f); fills[k] =
+// relleno de la región k en unidades de seg. Píxel (X, Y) con alpha de up < 128 → NO_REGION. Si no, (x, y) = (floor(X/U), floor(Y/U))
+// recortado al tamaño de seg: si su 3×3 en seg tiene una sola etiqueta ≥ 0, esa; con > 1, la k de ese 3×3 que minimiza
+// Σ_c (evaluateFill(fills[k], (X + 0.5)/U, (Y + 0.5)/U)_c − up_c)² (empate → la del píxel (x, y), después el id menor); sin ninguna → NO_REGION.
+export function rankMap(labels: Uint16Array, order: readonly number[]): Uint16Array
+// In place: etiqueta k → posición de k en order; NO_REGION se queda. Devuelve el mismo array.
+export function regionMask(ranks: Uint16Array, width: number, height: number, j: number, layering: Layering, dilate: number): BinaryMask
+// cutout: rank === j dilatada `dilate` veces con dilate1 (el pipeline pasa ceil(U/2)) ∧ rank ≥ j: la dilatación queda debajo de las capas
+// posteriores y nunca encima de las anteriores (fase 6, Decisiones); stacked: rank ≥ j. En ambos, ∧ rank ≠ NO_REGION.
+```
+
+### src/core/fillModel.ts (modo Degradados, fase 3; no importa regions.ts)
+```ts
+// Coordenadas: centro de píxel (x + 0.5, y + 0.5) en la resolución de img/seg (convención de "Reglas globales").
+export const MOMENTS_PER_REGION = 16
+// Momentos de la región k en m[16·k + i], sobre sus píxeles core (seg.core = 1 y región k), x e y = centros:
+export const M_N = 0, M_X = 1, M_Y = 2, M_XX = 3, M_XY = 4, M_YY = 5, M_R = 6, M_G = 7, M_B = 8,
+  M_RX = 9, M_GX = 10, M_BX = 11, M_RY = 12, M_GY = 13, M_BY = 14, M_CC = 15   // M_CC = Σ (R² + G² + B²)
+// Constantes exportadas (cifras en Decisiones, fase 3): MIN_MODEL_CORE 64; FLAT_RMSE_FLOOR 2, FLAT_RMSE_SIGMA 1.5; GRADIENT_RMSE_FLOOR 2.5,
+// GRADIENT_RMSE_SIGMA 2, GRADIENT_MAX_FLAT_RATIO 0.6; RADIAL_MAX_LINEAR_RATIO 0.85; STOP_EPS_FLOOR 1.5, STOP_EPS_SIGMA 0.8; RAMP_TRIM 0.005;
+// BIN_LENGTH 4, MIN_BINS 8, MAX_BINS 64; IRLS_PASSES 2, TUKEY_C 4.685, MAD_TO_SIGMA 1.4826, TUKEY_MIN_SCALE 1; RADIAL_SMOOTH_SIGMA 0.7,
+// RADIAL_MAX_SAMPLES 8192, RADIAL_MIN_SAMPLES 16, RADIAL_MIN_GRADIENT 0.05, RADIAL_MIN_CONDITION 0.05, RADIAL_MIN_RADIUS 2,
+// RADIAL_MONOTONE_EPS_FACTOR 2; MERGE_MIN_AREA_FLOOR 16, MERGE_MIN_AREA_SHARE 2e-5, MERGE_MAX_RMSE_GAIN 1.5, MERGE_MAX_BOUNDARY_JUMP 3,
+// MERGE_MAX_AXIS_DEG 15, MERGE_MAX_JOINT_PIXELS 32768, MERGE_MAX_BOUNDARY_SAMPLES 4096; MICRO_PER_BIN 16, PRUNE_MAX_RMSE_LOSS 0.05;
+// FLAT_END_TOL_FACTOR 2, MERGE_SMALL_MAX_OFFSET 24 (revisión de hallazgos).
+export function accumulateMoments(img: RasterImage, seg: Segmentation): Float64Array   // longitud 16·count; una pasada
+export interface RegionPixels { offsets: Int32Array; indices: Int32Array }
+export function corePixels(seg: Segmentation): RegionPixels
+// CSR: píxeles core de la región k = indices[offsets[k] .. offsets[k+1]) (y·W + x, en raster); offsets de longitud count + 1.
+export interface FitOptions { sigma: number; maxStops: number }
+export function fitFlat(m: Float64Array, id: number): { color: RGB; rmse: number }
+// media por canal; rmse = sqrt(max(0, M_CC − Σ_c S_c² / n) / (3n)) (pooled sobre R, G, B); n = 0 → [0, 0, 0] y 0.
+export interface Plane { cx: number; cy: number; mean: RGB; gx: RGB; gy: RGB; rmse: number }
+export function fitPlane(m: Float64Array, id: number): Plane
+// c(x, y) ≈ mean_c + gx_c·(x − cx) + gy_c·(y − cy), (cx, cy) = centroide del núcleo; mínimos cuadrados 2×2 centrados por canal;
+// determinante ≈ 0 (núcleo colineal) → gx = gy = 0; rmse pooled del plano.
+export function planeAxis(p: Plane): { ux: number; uy: number; strength: number; collinearity: number }
+// autovector principal unitario de Σ_c g_c g_cᵀ con g_c = (gx_c, gy_c), sin ponderar por luma (rampas solo de tono); strength = sqrt(λ1)
+// (niveles/px); collinearity = λ2/λ1 (0 si λ1 = 0); signo fijo: ux > 0, o ux = 0 y uy > 0.
+export function fitLinear(img: RasterImage, px: RegionPixels, id: number, plane: Plane, opts: FitOptions): { fill: LinearGradient; rmse: number } | null
+// eje = planeAxis(plane); t = proyección de los centros core; extremos p0.5 / p99.5 → (x1, y1) y (x2, y2) sobre la recta por el centroide;
+// L = longitud; K = clamp(round(L/4), 8, 64) bins → vértice por bin (parámetro y color medios ponderados) → Douglas–Peucker ε = max(1.5,
+// 0.8σ) (distancia RMS sobre R, G, B) → ≤ maxStops nudos, recolocados sobre MICRO_PER_BIN micro-bins por bin y podados mientras el RMSE
+// ponderado suba ≤ PRUNE_MAX_RMSE_LOSS → colores de parada = mínimos cuadrados ponderados de la rampa a trozos sobre los píxeles; IRLS Tukey
+// 2 pasadas. Extremos planos: mientras queden más de 2 paradas y la primera (o la última) esté a ≤ FLAT_END_TOL_FACTOR·ε niveles por canal de
+// su vecina, se quita y (x1, y1) o (x2, y2) pasa a la parada que queda (el pad ya pinta ese color), con los offsets reescalados a [0, 1].
+// rmse = el de la RAMPA de paradas (evaluateFill) sobre el núcleo, no el del plano. null si strength = 0 o L < 1 px.
+export function fitRadial(img: RasterImage, px: RegionPixels, id: number, opts: FitOptions & { support?: (pixel: number) => boolean }): { fill: RadialGradient; rmse: number } | null
+// centro = intersección por mínimos cuadrados de las rectas que siguen el gradiente de color de cada píxel core; r = p99.5 de ρ; bins sobre
+// ρ como fitLinear; null si el sistema es singular, r < 2 px o la rampa no es monótona. opts.support(p) dice si el píxel p (y·W + x) es de la
+// región para los soportes 9×9 / 3×3 de las derivadas (por defecto: estar en la lista de px); planMerges lo pasa cuando la lista es una muestra
+// por paso. Extremos planos como fitLinear: un centro plano deja su primera parada con offset > 0 (el centro no se mueve) y un borde plano
+// acerca r a la última parada que queda.
+export function selectModel(img: RasterImage, px: RegionPixels, id: number, moments: Float64Array, opts: FitOptions & { radial: boolean; support?: (pixel: number) => boolean }): RegionModel
+// Escalera: núcleo < 64 px → solid; rmseFlat ≤ max(2, 1.5σ) → solid; lineal aceptable si rmseLin ≤ max(2.5, 2σ) y ≤ 0.6·rmseFlat; radial
+// aceptable (solo con opts.radial) si rmseRad ≤ max(2.5, 2σ), ≤ 0.6·rmseFlat y ≤ 0.85·rmseLin (o sin lineal); gana el radial aceptable, si
+// no el lineal aceptable; si ninguno → complex = true con el candidato de menor rmse. isDegenerateGradient → solid. fill en unidades de img
+// con normalizeStops; rmse del fill elegido; rmseFlat; coreCount = núcleo.
+export function rmseOf(img: RasterImage, px: RegionPixels, id: number, fill: Fill): number   // RMSE pooled de evaluateFill sobre el núcleo de id
+export interface MergeOptions { sigma: number; minArea: number; maxRmseGain: number; maxBoundaryJump: number; pixels?: RegionPixels; maxStops?: number; radial?: boolean; smallGroups?: boolean }
+export function planMerges(img: RasterImage, seg: Segmentation, models: readonly RegionModel[], opts?: Partial<MergeOptions>): Array<[number, number]>
+// Pares [src, dst] (src se funde en dst), en orden de aplicación (union-find); el pipeline los aplica con regions.mergeRegions y re-ajusta
+// las fusionadas. 1) diminutas (area < minArea, defecto max(16, 2e-5·W·H)) y regiones sin núcleo, de menor a mayor área, al 4-vecino con
+//    mayor frontera común / (1 + rmseOf de su modelo sobre el núcleo de la diminuta y de lo que ya absorbió) (sin núcleo: la mayor frontera);
+//    un vecino sin núcleo solo como último recurso; 2) compatibles, voraz por menor coste rmseJoint − max(rmse_A, rmse_B): nunca dos lineales
+//    con ejes a más de MERGE_MAX_AXIS_DEG; salto = media sobre la frontera de la mayor diferencia por canal entre los dos modelos extrapolados
+//    linealmente (sin pad) al punto medio de cada par ≤ maxBoundaryJump (defecto 3 niveles); selectModel sobre A ∪ B (≤ 32 768 píxeles y
+//    ≤ 4096 pares, por paso uniforme; con paso > 1 fitRadial lee sus soportes de seg.core y las regiones de A y B) con rmse ≤ max(rmse_A,
+//    rmse_B) + maxRmseGain (defecto 1.5); si uno de los grupos tiene menos de MIN_MODEL_CORE píxeles de núcleo (sólido por la escalera, no por
+//    sus colores) y el salto falla, se admite igualmente cuando el modelo del otro grupo, extrapolado sin pad, falla su núcleo por RMSE
+//    ≤ MERGE_SMALL_MAX_OFFSET (prueba barata antes del ajuste conjunto) y el modelo conjunto también explica ese núcleo con RMSE
+//    ≤ max(rmse_A, rmse_B) + maxRmseGain (una punta de pluma cortada por un borde espurio; solo con opts.smallGroups, defecto true; el sondeo
+//    del clasificador lo desactiva); destino = la de mayor área (empate: id menor) y el
+//    grupo toma el modelo conjunto. src ≠ dst. opts.pixels debe ser corePixels(seg); opts.maxStops y opts.radial (defectos 8 y true) para los
+//    ajustes conjuntos.
+export function extendGradient(img: RasterImage, fill: Gradient, pixels: Int32Array): Gradient
+// Revisión de hallazgos. u = parámetro del degradado en cada píxel de `pixels` (lineal: proyección / |d|²; radial: ρ / r) y sus cuantiles
+// RAMP_TRIM uLo, uHi: un lineal con uLo < 0 o uHi > 1 lleva sus extremos a esos cuantiles y un radial con uHi > 1 pasa a r·uHi (el centro
+// queda), con los offsets reescalados y la primera y la última parada movidas hacia fuera sobre sus segmentos (color extrapolado y recortado a
+// [0, 255]); mismo número de paradas. Se devuelve solo si su RMSE sobre `pixels` es menor; si no, el mismo objeto.
+export function splitComplex(img: RasterImage, px: RegionPixels, id: number, opts: FitOptions): { assign: Uint8Array; fills: Fill[] } | null
+// NO implementada: devuelve siempre null y una región complex conserva su mejor candidato (selectModel). Contrato previsto: 2..4 subgrupos
+// (median cut sobre x, y y residuo); assign[i] = subgrupo del i-ésimo píxel core de id (orden de px); el pipeline crearía las subregiones.
+```
+
 ### src/core/classify.ts
 ```ts
 export function analyzeSource(img: RasterImage, bakedBackground?: 'auto' | 'keep'): SourceInfo // usa raster/edges/palette/threshold
@@ -193,11 +392,68 @@ export function classify(info: SourceInfo): ClassifyResult
 // photo (flat, colors=16, exactPalette=false + warning 'photo') si paletteColors===null || offPaletteShare(info) > 0.15
 // flat (colors 'auto') en otro caso
 // warning 'thin-strokes' si thinStrokeRatio > 0.5 en modo lines
+// ---- modo Degradados (fase 7; cifras en Decisiones, "Degradados, fase 7") ----
+export const GRADIENT_PROBE_MAX_SIDE = 512, GRADIENT_PROBE_MAX_STOPS = 4, GRADIENT_PROBE_MIN_COLORS = 8
+export const GRADIENT_MAX_EDGE_SHARE = 0.6, GRADIENT_MAX_REGIONS = 400, GRADIENT_MIN_EXPLAINED = 0.85
+export const GRADIENT_FLAT_MIN_GRADIENT_SHARE = 0.05, GRADIENT_SUGGEST_EXPLAINED = 0.5
+export const GRADIENT_MAX_COMPLEX_SHARE = 0.5, GRADIENT_PROBE_FOREIGN_RATIO = 2, GRADIENT_PROBE_INTERIOR_RADIUS = 2   // revisión de hallazgos
+export function gradientProbeFactor(width: number, height: number): number   // max(1, ceil(max(w, h) / GRADIENT_PROBE_MAX_SIDE))
+export function probeGradients(img: RasterImage, background?: RGB | null): GradientProbe
+// background: null = transparente (sin componer; el proxy se reduce sobre color premultiplicado, como el pipeline), RGB = se compone
+// encima; omitido = el de resolveBackground 'auto' (borderModeColor). Proxy (downscaleBoxRaster, f = gradientProbeFactor) → sigma =
+// immerkaerSigma(proxy) → seg = segmentRegions(proxy, { regionDetail: 1, sigma }). Si seg.edgeShare > GRADIENT_MAX_EDGE_SHARE o las regiones
+// crudas > MAX_GRADIENT_REGIONS (donde el modo Degradados cae a la paleta plana): { sigma, regions: crudas, explained: 0, linearShare: 0,
+// radialShare: 0, edgeShare } sin ajustar nada. Si no: accumulateMoments → selectModel por región (GRADIENT_PROBE_MAX_STOPS paradas,
+// radial) → UNA ronda de planMerges → mergeRegions → selectModel de las regiones que agrupan más de una (las demás conservan su modelo).
+// Fracciones del área etiquetada (píxeles del proxy con alpha ≥ 128): explained = regiones con rmse ≤ max(GRADIENT_RMSE_FLOOR,
+// GRADIENT_RMSE_SIGMA·sigma) (la cota de aceptación lineal de fillModel) menos sus píxeles ajenos: los que están a ≥ GRADIENT_PROBE_INTERIOR_RADIUS
+// px (Chebyshev) de cualquier otra etiqueta o transparencia y a más de GRADIENT_PROBE_FOREIGN_RATIO·sobHi niveles (máximo por canal) del modelo
+// de su región (una forma que la segmentación entregó a su vecina; el rmse de núcleo no los ve); linearShare / radialShare = regiones pintadas
+// con lineal / radial (complex incluidas). Si las regiones complex superan GRADIENT_MAX_COMPLEX_SHARE del área (donde el pipeline cae a la
+// paleta plana), con los modelos del primer ajuste (sin planMerges) o tras la ronda de fusiones: explained, linearShare y radialShare = 0.
+// 0×0 → todo 0. No muta.
+// analyzeSource: gradientProbe = (exact === null || offPaletteShare > PHOTO_OFF_PALETTE_RATIO || paletteColors ≥ GRADIENT_PROBE_MIN_COLORS)
+//   ? probeGradients(fuente efectiva, transparentRatio > 0.05 ? null : borderColor ?? blanco) : null
+//   [el plan decía solo la rama foto: el pájaro, radialDisc y diagonalSweep tienen paleta exacta de 19 / 9 / 9 colores; ver Decisiones]
+export function choosesGradient(probe: GradientProbe, flatPalette: boolean): boolean
+// edgeShare ≤ GRADIENT_MAX_EDGE_SHARE && regions ≤ GRADIENT_MAX_REGIONS && explained ≥ GRADIENT_MIN_EXPLAINED
+// && (!flatPalette || linearShare + radialShare ≥ GRADIENT_FLAT_MIN_GRADIENT_SHARE); flatPalette = paletteColors !== null && offPaletteShare ≤ 0.15.
+// classify: tras pixel y lines y ANTES de la regla flat: probe && choosesGradient(probe, flatPalette) → 'gradient' (params { mode: 'gradient' },
+// sin avisos) con el motivo "El N % de los píxeles se explica con M regiones de color plano o degradado (el K % con degradados): se vectoriza
+// en modo Degradados." (sin el paréntesis si K < 0.5 %; "1 región") y, en la rama flat, "Sus C colores planos cubren la imagen, pero partirían
+// cada degradado en bandas de color."; si no, flat o photo como antes, y el aviso 'photo' termina en " Prueba el modo Degradados." cuando
+// probe.explained ≥ GRADIENT_SUGGEST_EXPLAINED.
 ```
 
 ### src/core/pipeline.ts (integración; se escribe después de los demás)
 ```ts
-export interface PreparedLayer { mask: BinaryMask; fill: string; opacity?: number }
+export interface PreparedLayer { mask: BinaryMask | (() => BinaryMask); fill: string; opacity?: number; gradient?: Gradient }
+// mask perezosa: una función que construye la máscara al leerla (modo Degradados: una sola máscara U× viva a la vez); gradient en unidades
+// del viewBox (U×); fill '#rrggbb' (con gradient, el color medio de sus paradas).
+export function layerMask(pl: PreparedLayer): BinaryMask            // llama a la función en CADA lectura: quien la necesite dos veces la guarda
+export function isFullMask(mask: BinaryMask): boolean
+export function rectPath(w: number, h: number): AbsPath             // [0,w]×[0,h] en unidades del viewBox
+export async function traceLayers(prepared: Prepared, tracer: Tracer, opts: TracerOptions): Promise<Layer[]>
+// Compartida por trace() y el tuner (la copia de autotune.ts se borró): una Layer por PreparedLayer con paths; máscara llena → rectPath(W·U,
+// H·U) sin trazar; copia opacity (< 1) y gradient.
+export const GRADIENT_PROXY_AREA = 4e6            // segmentación y ajuste en un proxy de ≤ 4 Mpx
+export const GRADIENT_MAX_EDGE_SHARE = 0.6        // Segmentation.edgeShare por encima → fallback
+export const GRADIENT_MERGE_ROUNDS = 3            // rondas de planMerges → mergeRegions → reajuste
+export const GRADIENT_FIT_DEPTH = 1               // banda profunda: píxeles con alpha ≥ 250 cuyo 3×3 es de su región (núcleo o borde)
+export const GRADIENT_FIT_MIN_CORE_SHARE = 0.5    // núcleo < 0.5·|núcleo ∪ banda profunda| → se ajusta también sobre la unión
+export const GRADIENT_FIT_CORE_TOLERANCE = 0.5    // la unión gana si no se vuelve compleja y su RMSE sobre el núcleo ≤ el del núcleo + 0.5
+export const GRADIENT_MAX_COMPLEX_SHARE = 0.5     // regiones complex por encima de esta fracción del área etiquetada → fallback (revisión)
+export function gradientProxyFactor(width: number, height: number): number   // f = max(1, ceil(sqrt(W·H / GRADIENT_PROXY_AREA)))
+export type GradientFit =
+  | { kind: 'fallback'; reason: string }          // reason en español, minúscula inicial, sin punto final
+  | { kind: 'regions'; base: RasterImage; transparent: boolean; f: number; sigma: number; seg: Segmentation; models: RegionModel[]; rawRegions: number; mergeRounds: number }
+// seg y models en unidades del proxy (seg.core = núcleo de ajuste: núcleo ∪ banda profunda de las regiones ajustadas sobre ella); base = fuente
+// compuesta sobre el fondo resuelto (la fuente misma si es transparente). No depende de U, desenfoque ni capas: el tuner lo memoiza.
+export function fitGradientRegions(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): GradientFit
+export function prepareGradient(img: RasterImage, resolved: ResolvedParams, info: SourceInfo, fit?: GradientFit): Prepared   // fit = fitGradientRegions(img, resolved, info)
+export function prepareForMode(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): Prepared   // lines/flat/gradient; pixel lanza. trace() y el tuner la usan
+export function gradientFallbackWarning(reason: string | null): Warning
+// 'gradient-fallback': "No se pudieron reconstruir los degradados[: <reason>]. Se vectorizó como Color plano con 16 colores y pueden verse bandas de color."
 export interface Prepared { U: number; width: number; height: number; layers: PreparedLayer[]; warnings: Warning[] }
 export function prepareLines(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): Prepared
 export function prepareFlat(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): Prepared
@@ -213,10 +469,33 @@ export async function trace(img: RasterImage, params: TraceParams, tracers: Reco
 //        Fondo transparente (resolveBackground null): los píxeles con alpha<128 reciben la etiqueta centinela `count` → no cuentan
 //        para el orden por área, no pertenecen a NINGUNA capa (las máscaras se intersecan con alpha>=0.5) y no hay rect de fondo.
 //        Un color al que no se asigna ningún píxel no genera capa.
+// gradient: fitGradientRegions: fondo y composición como flat (resolveBackground; transparente → sin componer) → proxy ≤ 4 Mpx
+//        (f = gradientProxyFactor, downscaleBoxRaster, premultiplicado con transparencia) → sigma = immerkaerSigma(proxy) →
+//        edges = segmentEdges(proxy, { regionDetail, sigma }); si edges.edgeShare > GRADIENT_MAX_EDGE_SHARE: { kind: 'fallback', reason } con
+//        "el N % de la imagen es borde", sin etiquetar nada → seg = segmentRegions(proxy, { regionDetail, sigma, edges }); si seg.regions.count
+//        (regiones crudas) > MAX_GRADIENT_REGIONS: fallback con "la imagen se divide en N regiones (el límite es 2 000)" → selectModel por región (maxStops, radial = radialGradients) sobre su núcleo y, si el núcleo es
+//        < GRADIENT_FIT_MIN_CORE_SHARE de núcleo ∪ banda profunda, también sobre esa unión (gana según GRADIENT_FIT_CORE_TOLERANCE) → hasta
+//        GRADIENT_MERGE_ROUNDS rondas de planMerges(proxy, seg con el núcleo de ajuste, models, { sigma, pixels, maxStops, radial }) →
+//        mergeRegions → reajuste de las regiones nuevas que agrupan más de una (las demás conservan su modelo). splitComplex no existe: una
+//        región complex se pinta con su mejor candidato; si las complex superan GRADIENT_MAX_COMPLEX_SHARE del área etiquetada (tras el primer
+//        ajuste, sin rondas de fusión, y otra vez tras ellas): fallback con "el N % de la imagen no se explica con colores planos ni degradados".
+//        Por último cada degradado pasa por extendGradient sobre la banda
+//        profunda de su región (su rango de paradas llega al contorno y no se queda donde acaba el núcleo) y rmse se recalcula sobre el núcleo.
+//        prepareGradient: fallback → prepareFlat(img, { ...resolved, mode: 'flat', colors: 16, exactPalette: false }, info) +
+//        gradientFallbackWarning(reason). Si no: up = resampleRaster(base, U, sigmaPx, transparent) → ranks = refineLabels(seg del proxy,
+//        rellenos en unidades del proxy, up, U·f) → con f > 1, cada región del proxy sin ningún píxel cuyo 3×3 (dentro de la imagen) sea todo
+//        suyo (un trazo de ≤ 2 px en el proxy, promediado con su entorno por la reducción) pasa a sólido del color medio de los píxeles de up que
+//        refineLabels le dio, y si alguno cambió se vuelve a llamar a refineLabels con esos rellenos → regionOrder → rankMap → una capa por región
+//        con píxeles U×, en ese orden:
+//        { mask: () => regionMask(ranks, W·U, H·U, j, layering, cutout ? ceil(U/2) : 0), fill: rgbToHex(color) o gradientMeanHex(g),
+//        gradient: degradado no degenerado ? scaleGradient(g, U·f) : ausente }; avisos: upscale-capped y large-input. Las máscaras ya excluyen
+//        los píxeles con alpha(up) < 128 (NO_REGION), así que no se intersecan aparte con la máscara alfa. El fondo es una capa más (stacked
+//        sobre fondo opaco: máscara llena → rect en traceLayers). Sin <defs> ni gradient cuando todas las regiones son solid (flatShapes3 → 3
+//        capas sólidas).
 // pixel: detectGrid (o gridScale) → downscaleNearest → pixelSvg(…, tamaño de la fuente): el SVG mide siempre lo que la fuente y un gridScale que no la
 //        divide conserva los bloques parciales en píxeles fuente; stats: 3 nodos por rect (m h v h z), cornerFraction 1; warning 'too-many-rects' si > 10 000 rects.
 //        > MAX_PIXEL_RECTS (200 000): no se construye el SVG (svg '', stats a 0) y 'too-many-rects' explica el límite y remite a Color plano
-// trace(): info = analyzeSource(img) solo si hace falta (auto, lines o flat; un modo pixel explícito no la calcula);
+// trace(): info = analyzeSource(img) solo si hace falta (auto, lines, flat o gradient; un modo pixel explícito no la calcula); prepara con prepareForMode;
 //          mode auto → classify(info) y sus params rellenan los huecos de `params`; motor ausente → fallback + warning 'engine-unavailable';
 //          los warnings se deduplican por código; `ms` con performance.now()
 ```
@@ -245,6 +524,23 @@ export function countSegments(d: string): { lines: number; curves: number; moves
 export interface AssembleOptions { width: number; height: number; viewBoxWidth: number; viewBoxHeight: number; crispEdges?: boolean; precision?: number; background?: RGB | null }
 export function assembleSvg(layers: Layer[], opts: AssembleOptions): string
 // <svg xmlns="http://www.w3.org/2000/svg" width="W" height="H" viewBox="0 0 VW VH"> [ <rect fill=bg width=VW height=VH/> si background ] <path fill="#…" [fill-opacity] d="…"/> por capa (una path por capa con todas sus subrutas concatenadas, fill-rule="evenodd" cuando hay >1 subruta) </svg>. Sin XML prolog. Sin saltos de línea innecesarios (una capa por línea está bien).
+// Degradados (fase 4): si alguna capa con d no vacío lleva gradient y !isDegenerateGradient(gradient), justo tras '<svg …>' (antes del
+// <rect> de fondo) va '\n<defs>' + '\n' + serializeGradient(capa.gradient, id, precision) por cada una de esas capas + '\n</defs>', y esa capa
+// escribe fill="url(#id)" en lugar de layer.fill; el resto de atributos y su orden no cambian (fill, fill-opacity, fill-rule, d). Degradado
+// degenerado → layer.fill. Sin degradados la salida es byte-idéntica a la actual. Revisión de hallazgos: id = `g${h}-${n}` con n = 0, 1… en
+// orden de capas y h = gradientIdPrefix del documento escrito con los ids g0, g1…: estables para las mismas capas y distintos entre documentos
+// (dos SVG pegados en una página ya no resuelven url(#g0) al degradado del otro).
+export function gradientIdPrefix(s: string): string   // FNV-1a de 32 bits de las unidades UTF-16 de s, en base 36
+```
+
+### src/svg/gradients.ts (modo Degradados, fase 4)
+```ts
+export function serializeGradient(g: Gradient, id: string, precision: number): string
+// <linearGradient id="ID" gradientUnits="userSpaceOnUse" x1="…" y1="…" x2="…" y2="…"><stop offset="…" stop-color="#rrggbb"/>…</linearGradient>
+// <radialGradient id="ID" gradientUnits="userSpaceOnUse" cx="…" cy="…" r="…"><stop …/>…</radialGradient>
+// Coordenadas con formatNumber(v, precision) (la misma precisión que los paths); paradas = normalizeStops(g.stops), offset con
+// formatNumber(o, 4) y stop-color = rgbToHex; sin gradientTransform, fx, fy ni spreadMethod (pad por defecto). En una línea.
+export function gradientMeanHex(g: Gradient): string   // rgbToHex(gradientMeanColor(g))
 ```
 
 ### src/svg/optimize.ts (solo navegador, import perezoso; puede quedar para la fase de pulido)
@@ -315,13 +611,16 @@ export function diffHeatmap(a: RasterImage, b: RasterImage): RasterImage // d = 
 export function flattenPath(p: AbsPath, tolerance?: number): Array<Array<[number, number]>> // polilíneas cerradas por subruta; cúbicas/cuadráticas subdivididas adaptativamente (tol 0.1 px)
 export function rasterizeMask(paths: AbsPath[], width: number, height: number, supersample?: number): GrayImage // cobertura 0..255 nonzero winding, supersample 4 (4×4 subsamples)
 export function rasterizeLayers(layers: Layer[], width: number, height: number, background: RGB | null, supersample?: number): RasterImage // compone de atrás hacia delante con la cobertura como alpha
+// Degradados (fase 5): capa con gradient no degenerado → color del píxel (x, y) del raster = evaluateFill(gradient, x + 0.5, y + 0.5)
+// (unidades del raster = del viewBox), permitido vía LUT de 256 entradas por degradado sobre t (≤ 1 nivel frente a evaluateFill);
+// cobertura y composición como hoy. Capa sólida o degradado degenerado → parseFill(layer.fill), sin cambios.
 ```
 
 ### src/metrics/fidelity.ts
 ```ts
 export interface FidelityInput { original: RasterImage; rendered: RasterImage; mode: ConcreteMode; background: RGB; thresholdNorm?: number }
 export function computeMetrics(inp: FidelityInput): Metrics
-// ambos compuestos sobre background → gray; ROI = inkBBox(originalGray); SSIM y MAE sobre gaussianBlur σ=0.8; IoU sobre máscaras binarizadas SIN desenfocar (lines: umbral thresholdNorm ?? Otsu del original; flat/pixel: IoU = 1 - pctDiff16); fidelity = 0.6*ssim + 0.4*iou (clamp 0..1)
+// ambos compuestos sobre background → gray; ROI = inkBBox(originalGray); SSIM y MAE sobre gaussianBlur σ=0.8; IoU sobre máscaras binarizadas SIN desenfocar (lines: umbral thresholdNorm ?? Otsu del original; flat/gradient/pixel: IoU = 1 - pctDiff16); fidelity = 0.6*ssim + 0.4*iou (clamp 0..1)
 export function tunerScore(m: Metrics, stats: PathStats, perimeterPx: number): number // m.fidelity - 0.15*stats.cornerFraction - 0.10*min(1, stats.nodeCount / max(1, 2*perimeterPx))
 ```
 
@@ -342,6 +641,18 @@ export function bakedCheckerLogo(opts?: { size?; cell?; offset?; levels?; noise?
 // 128 px, celda 10 (fraccionaria admitida), niveles 255/204, ruido +-4 por canal con semilla; logo magenta #E6007E (disco AA + barra)
 // sobre un tablero pintado y opaco. background = cobertura < 0.5; counters: agujeros del disco; whiteRect: rectángulo blanco opaco
 export function chessboardGraphic(size?: number, cell?: number, levels?: [number, number], background?: RGB): { image; board: BinaryMask } // tablero 8×8 real sobre fondo sólido
+// ---- modo Degradados: patrón { image, verdad }; rellenos en coordenadas 1× continuas (centro de píxel +0.5) ----
+export interface GradientShape { sdf: Sdf; fill: Fill; label: number }
+export function gradientFeathers(size?: number, seed?: number): { image: RasterImage; shapes: GradientShape[]; labels: RegionMap; background: RGB }
+// 256, 1: abanico de 8 plumas (hexágonos romos, ejes a 7° + 22.5°·k) con degradado lineal de 2 paradas de la base (x1, y1) a la punta
+// (x2, y2); 3 (#2040d0 → #8030c0) y 4 (#8030c0 → #2040d0) comparten 32 px de lado recto (≥ 33 niveles de diferencia en todo el contacto);
+// sombra plana #20222a (disco r 11) sobre 6 y 7, dibujada la última; fondo blanco = etiqueta 0 (solid `background`); labels 0..9 (count 10),
+// shapes[k].label = k + 1. Pintado sin conflation (cobertura efectiva por submuestra, cada relleno evaluado en el centro del píxel). La
+// semilla solo varía la longitud de las puntas (× 0.94..1). Geometría exacta en el comentario de la función.
+export function radialDisc(size?: number): { image: RasterImage; fill: RadialGradient; sdf: Sdf }   // 128: disco (60, 66) r 48; radial #ffe08a@0 → #ff7a3d@0.5 → #7a1fa2@1 con r 48
+export function diagonalSweep(size?: number): { image: RasterImage; fill: LinearGradient; sdf: Sdf } // 128: cuadrado [16, 112] con esquinas r 20; (20, 108) → (108, 20): #feda75@0 #fa7e1e@0.3 #d62976@0.65 #962fbf@1
+export function hueRamp(size?: number): { image: RasterImage; fill: LinearGradient }               // 96: rampa horizontal #ed2b2b (x = 0) → #149e14 (x = size), luma Rec.601 101.006 constante
+export function withNoise(img: RasterImage, amp?: number, seed?: number): RasterImage               // 3, 1: entero uniforme en [−amp, amp] por canal RGB (independientes), alpha intacto
 export function encodePng?  // NO: sin dependencias
 ```
 
@@ -357,6 +668,34 @@ export function rasterEquals(a: RasterImage, b: RasterImage): boolean
 export function parseSvg(svg: string): { width; height; vbW; vbH; layers: Layer[]; paths: AbsPath[] } // extractPaths + parsePathData, una capa por <path>
 export function binarise(cov: GrayImage): BinaryMask          // cobertura >= 128
 export function renderAt1x(parsed, background: RGB | null): RasterImage // rasterizeLayers al tamaño del viewBox y downscaleBoxRaster(U) (o nearestUpscale en modo pixel)
+// Degradados (fase 4): parseSvg lee <defs> (linearGradient / radialGradient con sus stop) y a cada <path fill="url(#id)"> le asigna
+// layer.gradient (unidades del viewBox) y layer.fill = gradientMeanHex; renderAt1x los pinta vía rasterizeLayers.
+```
+
+### tests/fixtures/gradientCases.ts (casos de la revisión de hallazgos)
+```ts
+export function paintCases(width, height, background: RGB | null, shapes: PaintedCase[]): RasterImage   // supermuestreo 4×4, color premultiplicado
+export function thinBars(): { image; bars: Bar[] }                  // 200×120 blanco, barras (20,20,20) de 2..12 px desde x = 6.3
+export function feathersWithBars(), feathersWithRampButton()        // gradientFeathers(256) en 256×320 + 12 barras de 3-5 px / un botón en rampa
+export function steepRamp(w): { image; box; colourAt }              // 160×128 blanco, rectángulo en rampa (255·t, 0, 128·(1 − t)) de w px
+export function semiTransparentDisc(), gradientRectsWithSemiDisc()  // disco #ff8800 alfa 200 sobre transparencia / con tres rectángulos en rampa
+export function lowContrastShapes(delta), lowContrastDisc(delta)    // formas planas #3060c0 + delta dentro de un cuadrado #3060c0
+export function splitRadialDisc(): RasterImage                      // radialDisc(512) con la columna x = 240 del disco +60 en G y B
+export function fullColumns(bar), fullRows(bar): number[]
+```
+
+### Modo Degradados en la UI, métricas y fixtures de desarrollo (esqueleto; controles propios en la fase 8)
+```ts
+// format.ts: MODE_LABEL.gradient = 'Degradados'; fidelityExplanation('gradient') = la de flat (color píxel a píxel).
+// controlSchema.ts: MODES = ['auto', 'lines', 'flat', 'gradient', 'pixel']; 'layering' visible en flat y gradient (en gradient 'cutout' por
+//   defecto); colores/paleta exacta solo en flat. Fase 8, solo en gradient: "Detalle de regiones" (regionDetail 0.5–2, paso 0.1, "Menos ↔ Más
+//   regiones"), "Paradas máximas" (maxStops 2–8), toggle "Degradados radiales" (radialGradients), nota de Capas "Recortadas por defecto: cada
+//   forma con su propio degradado, editable".
+// warnings.ts: WARNING_TITLE['gradient-fallback'] = 'Degradados no reconstruidos', acción TO_FLAT ("Cambiar a Color plano"); empty-trace en
+//   gradient como en flat ("Quitar manchas mínimas"). Fase 8: el caso 'photo' ofrece "Usar degradados" cuando gradientCandidate. Revisión:
+//   mergeWarnings descarta el 'photo' del clasificador en modo gradient (describe la paleta plana de 16 colores y sugiere Degradados).
+// metrics/fidelity.ts: gradient se mide como flat. tuner: comparisonBackground trata gradient como flat.
+// src/dev/fixtures.ts: SYNTH_FIXTURES + 'gradient' (gradientFeathers(512)) y 'radial' (radialDisc(256)).
 ```
 
 ## Decisiones de implementación
@@ -1018,6 +1357,516 @@ Aclaraciones tomadas al implementar (los módulos las cumplen y los tests las fi
     99,4 % · Esquinas de 6 a 0 · Nodos de 50 a 13 · Tamaño de 1,7 KB a 600 B". La lista de cambios (Manrope, "Suavizado: 1,00
     → 1,15") conserva la flecha: Manrope tampoco la trae, queda fuera de esta revisión.
 
+- Degradados, fase 0: contrato, esqueleto del modo y fixtures (`src/types.ts`, `src/core/fillEval.ts`, `src/core/params.ts`,
+  `src/core/pipeline.ts`, `src/tuner/autotune.ts`, `src/dev/synth.ts`, UI), 2026-09-11. Lines, flat y pixel sin cambios.
+  · Salida idéntica byte a byte, comprobada contra una copia de HEAD (`git archive`, con un canario que confirma que esa copia no tiene
+    DEFAULTS.gradient): sha256 del SVG, stats y avisos de trace() en 8 fixtures (aaCircle, aaDiagonalLine, glyph, flatShapes3, sprite32 ×4,
+    transparentLogo, noisePhoto, bakedCheckerLogo) × auto/lines/flat/pixel × potrace/vtracer × stacked/cutout (128 trazados), más autotune
+    con reloj falso en glyph y flatShapes3 (svg, puntuación, evaluadas y params): 130 líneas idénticas. Bench real: tabla abajo.
+  · `traceLayers`, `isFullMask` y `rectPath` se exportan de pipeline y se borró su copia de autotune.ts; la preparación por modo es una sola
+    función, `prepareForMode`, que usan trace() y el tuner. `PreparedLayer.mask` admite una función (máscara perezosa) y todo lector pasa
+    por `layerMask` (31 lecturas directas cambiadas en los tests).
+  · [Sustituido en la fase 6: el fallback solo se usa con edgeShare > 0.6 o más de 2000 regiones.] `prepareGradient` es hoy el fallback: prepareFlat con 16 colores median cut (exactPalette false; la capa resuelta, 'cutout' por defecto)
+    más 'gradient-fallback' ("No se pudieron reconstruir los degradados. Se vectorizó como Color plano con 16 colores y pueden verse bandas
+    de color."). Medido: trace(flatShapes3(96), { mode: 'gradient' }) da 3 capas (a ≤ 8 niveles de la paleta), ese aviso y ningún `url(`.
+  · fillEval: `DEGENERATE_EPS` = 1e-6 (|d| y r) y `DEGENERATE_COLOR_SPAN` = 1 nivel, los del encargo. `normalizeStops` recorta colores a
+    [0, 255] sin redondear (el hex del SVG redondea: ≤ 0.5 niveles entre el rasterizador y el navegador) y deja una sola parada, la
+    posterior, cuando dos comparten offset (la rampa pierde ese salto duro). t con NaN → 0; geometría degenerada → t = 1 (última parada,
+    como SVG). Test de convención: para U ∈ {1, 2, 4}, scaleGradient(g, U) en (X + 0.5, Y + 0.5) = g en ((X + 0.5)/U, (Y + 0.5)/U) a < 1e-9.
+  · Parámetros: `regionDetail` [0.5, 2] (defecto 1), `maxStops` entero [2, 8] (defecto 8), `radialGradients` true solo si es true (la regla
+    de opticurve). Defaults en los 4 modos (ModeDefaults los exige; `PARAM_KEYS` de la UI los recoge: diffParams de flat a gradient =
+    ['mode', 'layering']). DEFAULTS.gradient = base + layering 'cutout'.
+  · UI mínima: "Degradados" entre Color plano y Píxel exacto (el control Modo pasa de 4 a 5 segmentos: la fase 8 debe comprobar su ancho en
+    el panel de 320 px); Capas visible en flat y gradient; 'gradient-fallback' con título "Degradados no reconstruidos" y acción "Cambiar a
+    Color plano"; empty-trace en gradient ofrece "Quitar manchas mínimas" como en flat. Build: index-*.js 75.48 kB (gzip 26.80),
+    trace.worker-*.js 177.07 kB.
+  · gradientFeathers (geometría exacta en su comentario):
+    - Una primera versión con cometas de vértices agudos (10.8° en la punta) daba etiquetas argmax partidas: plumas 2, 3, 6 y 7 en 3-4
+      piezas por astillas subpíxel. Con base y punta romas de 3 px, una pieza por etiqueta a 128 y 256 px (semillas 1-3 en el test, 1-8
+      medidas).
+    - Plumas 3 y 4: con sus bases sobre el arco los lados se solapaban 2.94 px y dejaban una astilla de la 3; ahora las bases están a
+      ±1.47 px (1.5·cos 11.25°) de la recta compartida y los lados coinciden. 44 pares 4-adyacentes; diferencia mínima entre las rampas en
+      el contacto 33.5-36.1 niveles (semillas 1-8; semilla 1: 35.7). El test exige ≥ 40 pares y ≥ 33 niveles: el contacto nunca llega a
+      t = 0.5, donde azul → púrpura y púrpura → azul coinciden.
+    - Hueco entre plumas vecinas no contiguas 4.1 px (7.5 px junto al par 3/4); nada a menos de 3 px del borde. Áreas a 256 px (semillas
+      1-8): plumas 774-967 px, sombra 380 px, fondo ≈ 57 900 px. Tiempo: 32 / 99 / 373 ms a 128 / 256 / 512 px.
+    - A 512 px (solo `?synth=gradient`) la etiqueta del fondo tiene 2 piezas: una mota en la cuña fina donde se separan 3 y 4.
+    - Pintado sin conflation (cobertura efectiva = submuestras cuya forma superior es esa): componiendo coberturas independientes como
+      flatShapes3, un lado compartido deja ver el fondo, f·(1 − f), hasta un 25 % de blanco en la costura, que regalaría el borde entre 3 y
+      4. Cada relleno se evalúa en el centro del píxel: un píxel interior es exactamente round(relleno) (test: > 90 % de los píxeles son
+      interiores, con diferencia ≤ 1 y su etiqueta).
+  · hueRamp: #ed2b2b y #149e14, de una búsqueda exhaustiva de rojos (R 200-240, G y B ≤ 70) y verdes (G 130-200, R y B ≤ 70) con
+    299R + 587G + 114B idéntico: luma 101.006 en ambos; tras redondear, |luma − 101.006| ≤ 0.5 en todos los píxeles.
+  · withNoise: entero uniforme en [−amp, amp] por canal e independiente (como el ruido de bakedCheckerLogo). amp 3: σ 2 por canal (test
+    2 ± 0.05 en 64×64) y 0.669·2 = 1.337 en luma. Immerkær sobre la luma SIN excluir bordes, semillas 1-3: gris plano y hueRamp
+    1.345-1.360, noisePhoto(256) 1.356-1.372, diagonalSweep 1.313-1.339, gradientFeathers 1.710-1.720 (limpio 0.979), flatShapes3
+    1.766-1.806 (limpio 0.480), radialDisc 1.933-1.962 (limpio 1.069). Para la fase 1: "ruido ±3 → σ̂ ∈ [1.4, 2.1]" no se alcanza sobre
+    contenido plano con un estimador correcto (≈ 1.34); no se cambió el ruido para encajar ese umbral.
+  · Bench (potrace): `samples/pajaro.png` (4001×4001) entra en NAMES como 'pajaro' con fila MEASURED medida con el pipeline actual
+    (clasificado flat con 19 colores exactos, offPaletteRatio 0.015, hardEdgeRatio 0.415, borderColor [0, 0, 0], sin aviso photo: el plan
+    esperaba foto y fondo blanco; la fase 7 actualiza la fila). Filas antes → después, idénticas salvo ms:
+
+    ```
+    image                            dims  mode   U      ms  layers  paths   nodes  corner  naive     bytes  fidel   ssim    iou    mae  pct16  warnings
+    antes (pajaro medido con la fila aún sin nombre ni MEASURED):
+    GENTERA                     1561x1672  flat   2     978       6      9    1853   0.012  0.095     70527  0.999  1.000  0.999    0.0  0.001  -
+    Instagram                   3840x2160  flat   1     886      12   4477   60446   0.020  0.020   2391810  0.940  0.991  0.862    1.6  0.138  photo
+    clip_art                      290x193  flat   4      96       2     55     678   0.080  0.085     22664  0.960  0.993  0.910    1.2  0.090  baked-checkerboard
+    eagle                         350x350  flat   4     344      14    316   22702   0.042  0.057    772116  0.900  0.983  0.776    2.9  0.224  photo
+    Compartamos avatar            800x800  flat   2     272       3     44    1027   0.167  0.302     33362  0.995  0.999  0.988    0.2  0.012  -
+    pajaro.png                  4001x4001  flat   1    2084      19   9767   46022   0.048  0.050   1891025  0.981  0.996  0.959    0.8  0.041  large-input
+    splash                        740x740  flat   2     383      16   2675   36945   0.058  0.068   1268085  0.897  0.950  0.818    2.6  0.182  baked-checkerboard,photo
+    después:
+    GENTERA                     1561x1672  flat   2     991       6      9    1853   0.012  0.095     70527  0.999  1.000  0.999    0.0  0.001  -
+    Instagram                   3840x2160  flat   1     951      12   4477   60446   0.020  0.020   2391810  0.940  0.991  0.862    1.6  0.138  photo
+    clip_art                      290x193  flat   4      93       2     55     678   0.080  0.085     22664  0.960  0.993  0.910    1.2  0.090  baked-checkerboard
+    eagle                         350x350  flat   4     341      14    316   22702   0.042  0.057    772116  0.900  0.983  0.776    2.9  0.224  photo
+    Compartamos avatar            800x800  flat   2     271       3     44    1027   0.167  0.302     33362  0.995  0.999  0.988    0.2  0.012  -
+    pajaro                      4001x4001  flat   1    2087      19   9767   46022   0.048  0.050   1891025  0.981  0.996  0.959    0.8  0.041  large-input
+    splash                        740x740  flat   2     386      16   2675   36945   0.058  0.068   1268085  0.897  0.950  0.818    2.6  0.182  baked-checkerboard,photo
+    ```
+
+- Degradados, fases 1 y 2: ruido, bordes y regiones (`src/core/noise.ts`, `src/core/edges.ts`, `src/core/regions.ts`), 2026-09-11.
+  · `immerkaerSigma`, exclusión de bordes: `EDGE_SOBEL_MIN` = 24 (el suelo Sobel de la segmentación) y `EDGE_SOBEL_PER_SIGMA` = 3; opaco =
+    alpha ≥ 250 en todo el 3×3; la exclusión se dilata al 3×3. σ̂ sin exclusión / con T = 16 / con T = 24:
+    ```
+    fixture                   sin excl.  T16    T24
+    flatShapes3               0.480      0.000  0.000   (conserva el 87 %)
+    flatShapes3 ±3            1.806      1.378  1.378
+    gradientFeathers(256)     0.979      0.010  0.011   (87 %)
+    gradientFeathers ±3       1.720      0.794  0.796
+    radialDisc                1.069      0.092  0.092
+    diagonalSweep             0.410      0.162  0.162
+    noisePhoto(256)           0.201      0.199  0.200   (conserva 19 % a T8, 75 % a T16, 97 % a T24)
+    pajaro 2× (2001²)         0.150      0.015  0.016
+    pajaro 8×                 0.515      0.015  0.018
+    ```
+    Rampa empinada (8 niveles/px) con ±3: T16 conserva 0-2 % de los píxeles y oscila entre 0.78 y 1.43; T24 conserva el 100 % y lee
+    1.27-1.43. 41-59 ms a 2001×2001. Objetivos del plan que un estimador correcto no alcanza (los tests fijan lo medido más estrecho):
+    "ruido ±3 → σ̂ ∈ [1.4, 2.1]": la luma da 0.669·2 = 1.337 en teoría, medido 1.340-1.382 en gris plano, hueRamp, flatShapes3 y
+    noisePhoto (semillas 1-3), test [1.33, 1.40]; en gradientFeathers 0.787-0.796 porque el blanco satura la mitad del ruido.
+    "noisePhoto > 3": es un campo bilineal suave, 0.199; test [0.15, 0.25] y ruido ±10 > 3.
+  · Bordes en gradientFeathers(256): edgeShare 0.1187 / 0.1184 / 0.1173 (semillas 1-3), con ±3 0.1185-0.1187; regionDetail 0.5 → 0.1055,
+    2 → 0.1277; 0.2055 a 128 px y 0.0610 a 512 px. Laplaciano dentro de las plumas (≥ 3 px Chebyshev de cualquier contorno): media
+    0.356, p99 0.5, máximo 0.75 (a 2 px del contorno llega a 9, alcance del AA); con ruido media 0.81 y máximo 1.875; todo bajo lapLo 2.7.
+    "Laplaciano < 0.5 en el interior" se cumple para la media (0.356-0.359), no para el máximo (doble redondeo: fixture y salida Uint8 del
+    desenfoque): test media < 0.5 y máximo ≤ 0.75. Plumas 3/4: los 44 pares de contacto son borde por ambos lados y ningún 4-camino de no
+    borde une las dos plumas. radialDisc edgeShare 0.368 con 2 regiones; diagonalSweep 0.091 con 2; hueRamp 0 con 1; noisePhoto 0.931
+    con 370 regiones (dispara el fallback de 0.6). Máscara de bordes = hysteresis(laplaciano) ∪ hysteresis(Sobel), dos pasadas separadas.
+  · `segmentRegions` NO usa los anillos de mayoría de `growIntoBand` (implementada tal cual y con tests): la banda se rellena por color
+    (`growByColour`, privada: crecimiento con semillas sobre el RGB sin desenfocar, prioridad |ΔR| + |ΔG| + |ΔB| entre 4-vecinos, cola de
+    `COLOUR_BUCKETS` = 766 cubetas FIFO dentro de cada prioridad, el píxel toma la etiqueta del 4-vecino etiquetado de color más parecido,
+    empate → id menor); los elegibles que no alcanza ninguna región forman componentes 4-conexas nuevas, como en el contrato. `BAND_RINGS`
+    sigue exportada sin uso. Motivo, gradientFeathers(256), semillas 1-5, limpio y ±3: los anillos daban puntas y bases de pluma al fondo,
+    122-132 regiones con 98-109 sin núcleo e IoU de la peor pluma 0.905-0.922 incluso fusionando fragmentos; el color da 23-28 regiones,
+    todas con núcleo, IoU 1.000 en todas las formas (semillas 1-3 limpias, tras fusionar) y 0.935 la peor con ruido. L1, máximo por canal y
+    L2 ponderada por luma dieron la misma IoU con semillas limpias; se eligió L1. Con transparencia el predesenfoque corre sobre color
+    premultiplicado y se despremultiplica, como prepareFlat.
+  · Regiones crudas de gradientFeathers(256), color / anillos: semillas 1-3 23 / 23 / 24 (126 / 132 / 130, 103 / 109 / 106 sin núcleo);
+    ±3: 26 / 26 / 28; regionDetail 0.5 / 1 / 2: 21 / 23 / 39; a 512 px 11 (10 de ≥ 320 px); a 128 px 18; 7-27 ms a 256 px. "10 ± 1
+    regiones de ≥ 16 px" no se cumple sobre la salida cruda con la definición de núcleo del contrato: quedan 13-14 fragmentos de 1-10 px de
+    núcleo en puntas, bases y el hueco de 7.5 px junto a 3/4, que crecen a ≥ 16 px (18 / 18 / 19 crudas de ≥ 16 px). El test de regions
+    aplica un sustituto documentado de planMerges (fusiona planas adyacentes con sd ≤ 4 y medias a ≤ 6; una región con < 16 px de núcleo
+    va al vecino de color más cercano): 10 regiones, IoU ≥ 0.97 (medido 1.000); con ruido 10-11 y mejor IoU por forma ≥ 0.93 (peor 0.935).
+    En el pipeline las fusiona planMerges (fase 6: 11 capas).
+  · `regionOrder`: la regla de contención (una región cuyo único vecino es a va después de a) solo se aplica si la región no toca el borde
+    de la imagen; sin esa condición un fondo cuyo único vecino es un anillo se pintaría después del anillo. En un ciclo (dos regiones que
+    solo se tocan entre sí, aisladas por transparencia) la primera por área conserva su sitio.
+  · `refineLabels`: suma sin ponderar sobre R, G y B (la del contrato, no los pesos de palette.colorDistance2); empate → la etiqueta del
+    píxel (x, y) y después el id menor. Con los rellenos verdaderos sobre la segmentación cruda (cada región con la forma mayoritaria):
+    100.000 % de acuerdo fuera de la banda AA a U = 2 y a U = 4 (99.54 / 99.47 % en total), igual con ruido; 2-8 ms por llamada.
+    `regionMask` cutout = distancia city-block ≤ dilate dentro de la caja de la región (test: igual a dilate1 aplicado k veces, k = 0..3;
+    desde la fase 6, además, ∩ rango ≥ j).
+  · pajaro (opaco), proxy 2× por caja (2001²): σ̂ 0.0164, edgeShare 0.0249, 51 regiones y 0 sin núcleo (anillos: 851 y 800 sin núcleo);
+    el fondo es el 86.5 % de los píxeles; 32 regiones de ≥ 320 px cubren el 99.98 % de los opacos y el 99.83 % de la tinta, 34 de ≥ 80 px
+    (2e-5·W·H) el 99.86 %, 46 son de ≥ 16 px. regionDetail 0.5: 47 regiones (30 de ≥ 320 px), edgeShare 0.0222; 2: 54 (32), 0.0269.
+    segmentRegions 375-503 ms: σ̂ 59, predesenfoque 173, mapas 49, histéresis 11 + 11, labelComponents 31, crecimiento por color ≈ 35,
+    adyacencia 11. Memoria por encima de la imagen de entrada: pico ≈ 46 MB (copia desenfocada y los dos mapas de 16 MB a la vez), ≈ 38 MB
+    en la histéresis, ≈ 31 MB etiquetando; la Segmentation devuelta retiene 22.9 MB (regions Int32 15.3, edge 3.8, core 3.8); con
+    transparencia ≈ 15 MB más por la copia premultiplicada. Con el proxy del plan (f = ceil(sqrt(W·H/4e6)) = 3 para 16.008 Mpx, no 2):
+    1334², σ̂ 0.019, edgeShare 0.0371, 56 regiones (46 ≥ minArea, 32 ≥ 320 px), 159 ms.
+  · Muestras reales (proxy del plan; regiones color / anillos; edgeShare): GENTERA 6 / 17, 0.012; Instagram (f = 2) 8 / 561, 0.048;
+    clip_art 291 / 339, 0.341; eagle 287 / 501, 0.633 (fallback); avatar 39 / 622, 0.075; splash 981 / 1566, 0.303.
+
+- Degradados, fase 3: modelos de relleno (`src/core/fillModel.ts`), 2026-09-11. Firmas del contrato; exporta además las constantes de la
+  firma, `MICRO_PER_BIN` y `PRUNE_MAX_RMSE_LOSS`. `tests/fixtures/segFromLabels.ts` exporta segFromLabels, immerkaerOnCore (σ̂ sobre píxeles
+  cuyo 3×3 entero es núcleo de una región), regionMapFromLabelMap, labelsFromSdf y singleRegion.
+  · Escalera como el plan: `MIN_MODEL_CORE` 64; sólido si rmseFlat ≤ max(2, 1.5σ̂); degradado aceptable si rmse ≤ max(2.5, 2σ̂) y
+    ≤ 0.6·rmseFlat; radial además ≤ 0.85·rmseLin. Douglas–Peucker ε = max(1.5, 0.8σ̂) con distancia RMS sobre R, G, B en el parámetro del
+    vértice (la unidad del RMSE). Extensión de la rampa = percentiles 0.5 y 99.5; K = clamp(round(L/4), 8, 64); vértice de un bin =
+    parámetro y color medios ponderados, no el centro del bin. IRLS 2 pasadas Tukey con c = 4.685·max(1.4826·MAD, `TUKEY_MIN_SCALE` 1
+    nivel): sin el suelo, en imágenes limpias (MAD ≈ 0.25) cualquier píxel a más de 1.7 niveles pesaba 0.
+  · Colores de parada: mínimos cuadrados ponderados de la rampa lineal a trozos sobre los píxeles (base de sombreros, sistema
+    tridiagonal), así que los extremos no necesitan regla de extrapolación. Refinado de nudos (añadido): `MICRO_PER_BIN` 16 micro-bins por
+    bin guardados como sumas prefijas (cualquier conjunto de nudos cuesta O(nudos)); cada nudo se coloca por búsqueda exhaustiva en esa
+    rejilla y después se quita el nudo interior cuya eliminación (recolocando sus vecinos) cuesta menos mientras el RMSE ponderado suba
+    ≤ `PRUNE_MAX_RMSE_LOSS` 0.05:
+    ```
+    fixture         solo Douglas–Peucker                                  con refinado y poda
+    radialDisc      4 paradas (0, .449, .553, 1), err 0.83, rmse 1.12     3 (0, .511, 1; codo real 24/46.93 = .511), err 0.02, rmse 0.28
+    diagonalSweep   5 paradas, rmse 0.46                                  4 (0, .277, .665, 1), rmse 0.38
+    plumas con ±3   una parada espuria en .067 (semilla 2)                2 paradas en 320 de 320 casos (40 semillas)
+    ```
+    Con 8 micro-bins y sin recolocar vecinos al quitar, radialDisc conservaba 2 nudos (.506 y .517).
+  · Centro radial: derivadas con gaussiana σ 0.7 y diferencias centrales solo donde el soporte 9×9 es núcleo de la región (con menos de
+    16 muestras, 3×3 sin suavizar); ≤ `RADIAL_MAX_SAMPLES` 8192 muestras; se saltan las de gradiente < `RADIAL_MIN_GRADIENT` 0.05
+    niveles/px. `RADIAL_MIN_CONDITION` 0.05; λmin/λmax medido: radialDisc 1.000 (con ruido 0.997), plumas limpias 0.000-0.016,
+    diagonalSweep 0.000, hueRamp 0.000, plumas con ruido 0.085-0.691 (al ruido lo rechaza la escalera, no esta prueba).
+    `RADIAL_MIN_RADIUS` 2 px; monotonía del canal dominante con tolerancia 2ε (3 niveles en imágenes limpias); el origen de la rampa es 0
+    si el percentil 0.5 de ρ queda a menos de un bin.
+  · Fusiones: `MERGE_MIN_AREA` = max(16, 2e-5·W·H); `MERGE_MAX_RMSE_GAIN` 1.5; `MERGE_MAX_BOUNDARY_JUMP` 3; `MERGE_MAX_AXIS_DEG` 15. El
+    salto es la media, sobre los pares de frontera en el punto medio de sus dos centros, de la mayor diferencia por canal entre los dos
+    modelos extrapolados linealmente más allá de sus paradas extremas (sin pad: con pad las dos mitades de una pluma cortada en
+    perpendicular a su eje saltaban ≈ 6 niveles, 1.55 niveles/px por ≈ 2 px a cada lado del corte). Ajustes conjuntos = selectModel sobre
+    A ∪ B con ≤ `MERGE_MAX_JOINT_PIXELS` 32 768 píxeles núcleo y ≤ `MERGE_MAX_BOUNDARY_SAMPLES` 4096 pares de frontera, por paso uniforme.
+    Voraz por coste rmseJoint − max(rmseA, rmseB); destino = mayor área (empate: id menor) y el grupo toma el modelo conjunto.
+    Cuantiles: orden exacto hasta 65 536 valores, histograma de 65 536 cubetas por encima. `splitComplex` no está implementada.
+  · Sobre segmentaciones verdaderas (segFromLabels): gradientFeathers(256, 1), σ̂ 0.011, borde 4.6 %, 10 regiones en ≈ 8 ms: las 8 plumas
+    lineales de 2 paradas, eje a 0.01-0.35°, parada ≤ 0.41 niveles, rmse 0.25-0.33 (plano 12.7-23.3); fondo y sombra sólidos, rmse 0.00.
+    Con ±3 (semillas 1-3): todas lineales de 2 paradas, parada ≤ 0.97, rmse 1.76-2.05 (σ̂ 0.79-0.80, no 1.34: domina el blanco saturado).
+    radialDisc: radial, centro a 0.00 px (con ruido 0.02), r 46.93 frente a 48 (2.2 %), 3 paradas, err 0.02 (ruido 1.39), rmse 0.28 (ruido
+    1.96); diagonalSweep: lineal, eje 0.00°, 4 paradas, err 0.24, rmse 0.38 (con maxStops 2 o 3, como mucho 2 o 3); hueRamp: lineal, eje
+    0.00°, 2 paradas, rmse 0.29; flatShapes3: 3 sólidas, rmse 0.00. planMerges: ninguna pareja sobre la verdad; las mitades de las plumas
+    5 y 3, cortadas a lo largo o a lo ancho, se fusionan; 3 y 4 nunca; una mota y una línea de 1 px sin núcleo van al fondo; dos rampas a
+    20° con límites laxos no se fusionan y alineadas sí ([[1, 0]]); cadena diminuta [[3, 2], [2, 1]].
+  · pajaro con la segmentación provisional del agente de la fase 3 (predesenfoque 0.7, laplaciano y Sobel RGB con histéresis, núcleo
+    4-conexo, 3 anillos de banda; no la de regions.ts): proxy f = 3, σ̂ 0.211, borde 3.7 %, 609 regiones, 577 fusiones, 32 finales (13
+    sólidas, 18 lineales, 1 compleja); RMSE núcleo de la tinta plano 22.40 → modelo 2.83 (todo: 7.67 → 0.97); 90.8 % de la tinta con rmse
+    ≤ 2.5; momentos 24 ms, selectModel de 609 regiones 233 ms, planMerges 11 ms, reajuste de 32 regiones 241 ms (fitLinear 128, fitRadial
+    64, radial rechazado en 18 de 19). A 4001×4001: σ̂ 0.093, borde 1.3 %, 1458 regiones, 1426 fusiones, 32 finales; tinta 22.77 → 2.77;
+    momentos 676 ms, modelos 643, planMerges 40, reajuste 829.
+
+- Degradados, fase 6: `prepareGradient` completo (`src/core/pipeline.ts`, `src/tuner/autotune.ts`; defecto corregido en `regionMask`),
+  2026-09-11. Lines, flat y pixel sin cambios: fuera del modo gradient el diff de pipeline.ts solo toca la cabecera y un import, y el
+  bench da las mismas filas que en la fase 0 (salvo ms, tabla abajo).
+  · Contrato en la firma: `fitGradientRegions` (fondo, proxy f = `gradientProxyFactor` por caja, premultiplicado con transparencia, σ̂,
+    segmentRegions, fallback, modelos, ≤ `GRADIENT_MERGE_ROUNDS` 3 rondas de planMerges → mergeRegions → reajuste de las regiones que agrupan
+    más de una) y `prepareGradient(img, resolved, info, fit?)`. `GRADIENT_PROXY_AREA` 4e6, `GRADIENT_MAX_EDGE_SHARE` 0.6 y
+    `MAX_GRADIENT_REGIONS` 2000 sobre las regiones crudas (el contrato de la fase 6; en los proxies medidos las crudas son ≤ 981). Motivos
+    del aviso: "el N % de la imagen es borde" (noisePhoto(64): 94 %, 16 capas planas) y "la imagen se divide en N regiones (el límite es
+    2 000)" (celdas de 20 px en 1000²: 2 500). pajaro necesitó 1 ronda (56 → 33 regiones); gradientFeathers(256) 1.
+  · refineLabels corre sobre la segmentación del proxy con U·f, como dice el contrato, y no sobre las etiquetas del proxy llevadas a 1× por
+    vecino más cercano y refinadas con U: el 3×3 del proxy abarca el error de escalera (hasta f − 1 px a 1×) y la memoria extra es la del
+    proxy. pajaro (U 1, f 3, potrace):
+    ```
+    refinado                                         preparar  trazar   fidelidad  nodos  bytes    arrayBuffers pico
+    A: segmentación del proxy, U·f (implementado)    606 ms    1918 ms  0.9956     836    37 492   293 MB
+    B: etiquetas 1× por vecino más cercano, U        832 ms    1643 ms  0.9954     1706   71 235   423 MB
+    ```
+  · La intersección con la máscara alfa de up no se construye aparte: refineLabels da NO_REGION a todo píxel de up con alpha < 128 (el mismo
+    corte que maskFromAlpha(up, 0.5)) y regionMask nunca pinta NO_REGION. transparentLogo(64) en gradient: 1 capa, IoU del alfa 0.9929.
+  · Defecto de regionMask (tests que fallaban antes del arreglo: gradientFeathers(256) fidelidad 0.9668 < 0.98, con ±3 0.9663 < 0.97, y el
+    unitario "cutout never paints over an earlier layer" con 15 píxeles): la dilatación ceil(U/2) de cutout pintaba encima de las capas
+    anteriores y engordaba cada forma medio píxel a 1× sobre el fondo. Variantes medidas en gradientFeathers(256), potrace, U 4:
+    ```
+    capas                                         fidelidad  SSIM    IoU     nodos  píxeles > 16 (todos a 1 px del contorno)
+    cutout, dilatación sobre todo (antes)         0.9668     0.9821  0.9439  612    2141
+    stacked (rango ≥ j)                           0.9937     0.9988  0.9860  1245   535
+    cutout, dilatación solo bajo rangos ≥ j       0.9982     0.9996  0.9963  605    143
+    cutout sin dilatar                            0.9982     0.9995  0.9963  608    154
+    con ±3: antes / stacked / solo bajo ≥ j       0.9663 / 0.9931 / 0.9977
+    ```
+    Ahora cutout = dilate_k(rango j) ∩ rango ≥ j: la dilatación queda debajo de las capas posteriores (sin costuras: 0 de 5473 píxeles de
+    núcleo con color de fondo) y cada forma conserva su contorno. flat no usa regionMask.
+  · Defecto del ajuste (test que fallaba: radialDisc(128) con r/U = 24.91 frente a 48, 2 paradas, fidelidad 0.6871): la histéresis del
+    Sobel inunda desde el contorno el anillo de rampa empinada (R 5.5 niveles/px → Sobel ÷4 = 11 > sobLo 9.6), el núcleo se queda en 1976
+    de 7256 píxeles (ρ < 24) y la rampa ajustada termina en ρ = 24.9 con pad. Arreglo en el pipeline, no en la segmentación: banda profunda =
+    píxeles con alpha ≥ 250 cuyo 3×3 (`GRADIENT_FIT_DEPTH` 1) es todo de su región; una región cuyo núcleo es < `GRADIENT_FIT_MIN_CORE_SHARE`
+    0.5 de su núcleo ∪ banda profunda se ajusta también sobre la unión, que gana si no se vuelve compleja y su RMSE sobre el núcleo ≤ el del
+    ajuste de núcleo + `GRADIENT_FIT_CORE_TOLERANCE` 0.5 niveles. Medido tras las fusiones (cuota = núcleo / unión; RMSE del ajuste de núcleo,
+    entre paréntesis sobre la unión; del ajuste de unión, entre paréntesis sobre el núcleo):
+    ```
+    caso                                        cuota      ajuste de núcleo               ajuste de unión
+    radialDisc, disco                           0.29       radial 0.95 (55.45)            radial 0.28 (0.24)       → unión
+    diagonalSweep, cuadrado                     0.96       lineal 0.40 (0.57)             lineal 0.39 (0.31)
+    gradientFeathers(256), plumas               0.60-0.78  lineal 0.25-0.32 (0.83-1.54)   lineal 0.25-0.33 (0.23-0.30)
+    fragmentos con 2-3 px de núcleo             0.07-0.12  sólido 0.82-2.35 (3.34-5.83)   sólido 2.79-3.93 (2.13-4.70)  → núcleo
+    gradientFeathers ×8 bicúbico, proxy 1024²   0.81-0.90  lineal 0.36-0.46 (6.1-12.9)    compleja 5.3-12.3 (0.41-2.43)
+    pajaro f = 3, las 32 regiones ≥ 320 px      0.79-0.99  igual a la unión o mejor       fondo compleja 6.36 (0.37)
+    ```
+    Ajustar siempre sobre la unión volvía complejas las 10 regiones del bicúbico (bordes suaves de 4-6 px) con radio 1, 7 con radio 2, y
+    añadía una compleja en pajaro; con radio 2 radialDisc quedaba en r 45.57 (5.07 %). Con la regla: radialDisc r 46.72 (2.7 %), centro
+    (60.00, 66.00), 4 paradas, 2 capas, fidelidad 0.9984; gradientFeathers, el bicúbico y pajaro no cambian.
+  · `tests/pipeline/gradientRoundTrip.test.ts` (potrace), umbrales del plan con lo medido: gradientFeathers(256) sin avisos, U 4, cutout, 11
+    capas (10 ± 1), 8 <linearGradient> y 0 radiales, una capa distinta pinta ≥ 90 % del núcleo de cada forma (sin evenodd en las plumas),
+    RMSE de núcleo por forma 1.36 / 1.27 / 1.07 / 1.10 / 1.30 / 1.01 / 1.08 / 1.52 / 0.00 (< 2), costuras 0 / 5473 (< 0.1 %), fidelidad
+    0.9982 (≥ 0.98), 571 nodos, 20 574 bytes; radialDisc 1 <radialGradient>, centro a 0.00 px (≤ 2), r 2.7 % (≤ 5 %), fidelidad 0.9984
+    (≥ 0.98, la cifra de la verificación en navegador del plan); ±3: 13 capas, 8 lineales, 0.9977 (≥ 0.97); flatShapes3: 3 capas sólidas a
+    ≤ 2 niveles de la paleta, sin <defs>, acuerdo 100.00 % (9107 / 9107, ≥ 98 %), fidelidad 0.9966; noisePhoto(64): 'gradient-fallback' con
+    su motivo y 16 capas; convención U = 1, 2, 4: coordenadas / U idénticas a ≤ 0.1 px (difieren solo en el redondeo a 3 decimales), peor eje
+    0.45-0.46° (≤ 3°), peor RMSE de núcleo 1.52-1.54 (< 2); gradientFeathers ×8 bicúbico (2048², f = 2): 10 capas, 8 lineales con eje ≤ 3°;
+    celdas de 20 px: fallback por regiones. gradientMode.test.ts pasa de esperar el fallback en flatShapes3 a esperar 3 capas sin aviso; el
+    fallback se prueba con noisePhoto(64).
+  · Tuner: `prepare()` memoiza fitGradientRegions por imagen (WeakMap en el contexto) con clave background|regionDetail|maxStops|
+    radialGradients. autotune(gradientFeathers(128), { mode: 'gradient' }): 0.9669 → 0.9770 (fidelidad 0.9877 → 0.9850, dentro de la
+    guarda), 71 evaluados, completo, 1.3 s, svg === trace(result.params).svg. Antes del arreglo de regionMask: 0.8861 → 0.9083.
+  · pajaro (4001×4001, potrace, U 1) en gradient forzado frente a la fila actual del bench (Auto → flat, 19 colores exactos), misma medida
+    (renderAt1x sobre borderColor):
+    ```
+    modo      ms    capas  lineales  paths  nodos   esquinas  bytes      fidelidad  SSIM    IoU     MAE   pct16   maxRSS durante trace()
+    flat      2229  19     0         9767   46022   0.048     1 891 025  0.9810     0.9957  0.9590  0.79  0.0410  +444 MB
+    gradient  3336  33     19        46     836     0.089     37 492     0.9956     0.9957  0.9953  0.38  0.0047  +149 MB
+    ```
+    f 3 (1334²), σ̂ 0.019, edgeShare 0.0371, 56 regiones crudas → 33 en 1 ronda: 14 sólidas (7 azules marino #013780), 18 lineales, 1
+    compleja pintada con su mejor candidato (lineal de 4 paradas, rmse 8.81 frente a plano 14.33, 196 704 px = 9.1 % de la tinta; candidata a
+    splitComplex); ningún radial ni ninguna región con banda profunda. RMSE de la tinta ponderado por área 2.71 frente a 21.90 del plano;
+    90.9 % de la tinta en regiones no complejas, todas con rmse ≤ 2.5. Tiempos: fitGradientRegions 871-1245 ms, preparar (resample,
+    refineLabels, orden) 606 ms, trazar 33 máscaras 1918 ms. Memoria (process.memoryUsage): arrayBuffers 291 MB antes (fuente y decodificado),
+    187 tras el ajuste (libera el decodificado), 293 tras preparar y durante el trazado (el ajuste retiene la copia compuesta de 64 MB y los
+    rangos Uint16 ocupan 32 MB; una máscara viva de 16 MB); maxRSS +149 MB (flat +444 MB: 19 máscaras ansiosas de 16 MB).
+  · Todas las muestras con el modo forzado (información para la fase 7; fidelidad frente a la fuente efectiva sobre borderColor):
+    ```
+    muestra     f  σ̂      edgeShare  regiones (crudas → finales)       capas  lin  rad  nodos   bytes     fidelidad  bench (modo)
+    GENTERA     1  0.000  0.012      6 → 6 sólidas                     6      0    0    1215    46 346    1.000      0.999 (flat)
+    Instagram   2  0.147  0.045      8 → 6 (2 complejas, 70.7 %)       6      3    0    336     14 475    0.868      0.940 (photo)
+    clip_art    fallback: el 76 % de la imagen es borde               2      0    0    808     26 781    0.957      0.960 (flat)
+    eagle       fallback: el 63 % de la imagen es borde               14     0    0    12172   423 369   0.900      0.900 (photo)
+    avatar      1  0.043  0.075      39 → 34 sólidas                   34     0    0    1262    41 830    0.996      0.995 (flat)
+    pajaro      3  0.019  0.037      56 → 33 (1 compleja, 1.2 %)       33     19   0    836     37 492    0.996      0.981 (flat)
+    splash      1  0.573  0.570      799 → 551 (16 complejas, 64 %)    390    34   3    7755    279 015   0.888      0.897 (photo)
+    ```
+    Instagram y splash empeoran en gradient (regiones complejas grandes: rampas multicolor que ni lineal ni radial explican): el clasificador
+    de la fase 7 no debe elegir gradient con explained bajo.
+  · Bench (potrace), tras la fase 6 (idéntico a la fase 0 salvo ms):
+
+    ```
+    image                            dims  mode   U      ms  layers  paths   nodes  corner  naive     bytes  fidel   ssim    iou    mae  pct16  warnings
+    GENTERA                     1561x1672  flat   2    1029       6      9    1853   0.012  0.095     70527  0.999  1.000  0.999    0.0  0.001  -
+    Instagram                   3840x2160  flat   1     930      12   4477   60446   0.020  0.020   2391810  0.940  0.991  0.862    1.6  0.138  photo
+    clip_art                      290x193  flat   4      97       2     55     678   0.080  0.085     22664  0.960  0.993  0.910    1.2  0.090  baked-checkerboard
+    eagle                         350x350  flat   4     356      14    316   22702   0.042  0.057    772116  0.900  0.983  0.776    2.9  0.224  photo
+    Compartamos avatar            800x800  flat   2     284       3     44    1027   0.167  0.302     33362  0.995  0.999  0.988    0.2  0.012  -
+    pajaro                      4001x4001  flat   1    2175      19   9767   46022   0.048  0.050   1891025  0.981  0.996  0.959    0.8  0.041  large-input
+    splash                        740x740  flat   2     397      16   2675   36945   0.058  0.068   1268085  0.897  0.950  0.818    2.6  0.182  baked-checkerboard,photo
+    ```
+
+- Degradados, fase 7: clasificador, `GradientProbe` y bench con el pájaro (`src/core/classify.ts`, `tests/core/classify.test.ts`,
+  `tests/bench/gradientProbe.test.ts` nuevo, `tests/bench/realImages.test.ts`), 2026-09-11. Fuera de la clasificación nada cambia: GENTERA,
+  Instagram, clip_art, eagle, avatar y splash dan en el bench las mismas filas que en la fase 6 (salvo ms); solo pajaro cambia de modo.
+  · Tabla de medida (`BENCH=1 npx vitest run tests/bench/gradientProbe.test.ts`, potrace). sondeo = analyzeSource lo calcula; los valores son
+    los de probeGradients sobre la fuente efectiva aunque analyzeSource no lo calcule; pxMs = mediana de 5 sobre el proxy ≤ 512 px, fullMs =
+    con la composición y la reducción de la imagen completa; modo = el clasificado (* = aviso photo); fidAuto / fidGrad = fidelidad del trazado
+    clasificado y del forzado a gradient (la medida del bench):
+    ```
+    image                      dims   f   pal  offSh  sondeo  sigma   edge    reg   expl    lin    rad    pxMs  fullMs  modo      fidAuto  fidGrad  trazado gradient
+    GENTERA               1561x1672   4     6  0.001  no      0.000  0.049      6  1.000  0.000  0.000    17.6      64  flat       0.9993   0.9996  6 capas, 0 lin
+    Instagram             3840x2160   8  null  0.100  sí      0.118  0.161      6  0.294  0.757  0.000    43.5     114  flat*      0.9395   0.8684  6 capas, 3 lin
+    clip_art                290x193   1     2  0.041  no      1.052  0.756    179  0.000  0.000  0.000     5.0       7  flat       0.9597   0.9566  fallback, 2 capas
+    eagle                   350x350   1  null  0.260  sí      0.465  0.633    287  0.000  0.000  0.000    14.3      14  flat*      0.9000   0.8999  fallback, 14 capas
+    Compartamos avatar      800x800   2     3  0.010  no      0.013  0.145     25  1.000  0.000  0.000    36.4      51  flat       0.9946   0.9958  34 capas, 0 lin
+    pajaro                4001x4001   8    19  0.015  sí      0.018  0.090     39  0.988  0.096  0.000    49.5     180  gradient   0.9956   0.9956  33 capas, 19 lin
+    splash                  740x740   2  null  0.161  sí      1.166  0.768    466  0.000  0.000  0.000    13.0      19  flat*      0.8973   0.8881  390 capas, 34 lin, 3 rad
+    gradientFeathers        256x256   1  null  0.095  sí      0.011  0.119     11  1.000  0.110  0.000    12.3      13  gradient        -        -
+    radialDisc              128x128   1     9  0.031  sí      0.092  0.368      2  1.000  0.000  0.443     2.7       3  gradient        -        -
+    diagonalSweep           128x128   1     9  0.017  sí      0.162  0.091      2  1.000  0.542  0.000     9.1       9  gradient        -        -
+    gradientFeathers ±3     256x256   1    19  0.029  sí      0.796  0.118     13  1.000  0.108  0.000    27.5      28  gradient        -        -
+    noisePhoto               64x64    1  null  0.782  sí      0.198  0.943     23  0.000  0.000  0.000     0.6       1  flat*           -        -
+    noisePhoto(256)         256x256   1     7  0.823  sí      0.200  0.931    370  0.000  0.000  0.000    12.3      12  flat*           -        -
+    flatShapes3              96x96    1     3  0.008  no      0.000  0.121      3  1.000  0.000  0.000     1.0       1  flat            -        -
+    ```
+  · Rama del sondeo (desviación del contrato, medida): el plan suponía el pájaro en la rama foto, pero `samples/pajaro.png` tiene 19 colores
+    exactos con offPaletteShare 0.015 (flat desde la fase 0), radialDisc y diagonalSweep 9 (0.031 / 0.017) y gradientFeathers ±3 19 (0.029).
+    Con el sondeo solo en la rama foto ninguno llega a él y "pajaro, radialDisc y diagonalSweep → gradient" es inalcanzable con cualquier
+    constante. La paleta exacta de una rampa suave es una escalera de colores dentro de la tolerancia, así que también se sondea con
+    paletteColors ≥ `GRADIENT_PROBE_MIN_COLORS` 8. Paletas medidas (analyzeSource): arte plano ≤ 6 (GENTERA 6, avatar 3, flatShapes3 3 con y
+    sin ±3, clip_art 2, ringedDisc 2-3, accentIcon 3; aaCircle, glyph, transparentLogo y bakedCheckerLogo 1-2 y además lines); degradados ≥ 9
+    (radialDisc 9 limpio, 10 con ±3, también a 256 px; diagonalSweep 9-10; gradientFeathers(128) 15; gradientFeathers ±3 semillas 1 y 3: 19 y 21;
+    pajaro 19). 8 es el entero central entre 6 y 9: GENTERA, clip_art, avatar y flatShapes3 siguen sin sondeo. Límite conocido: hueRamp (rampa
+    roja → verde a lo ancho, 6 colores exactos) queda fuera y sigue flat.
+  · En la rama flat la paleta exacta ya cubre la imagen, así que gradient exige además degradados: linearShare + radialShare ≥
+    `GRADIENT_FLAT_MIN_GRADIENT_SHARE` 0.05. Sondeo de arte plano: 0.000 en todos (GENTERA, avatar, flatShapes3 con y sin ±3, ringedDisc,
+    accentIcon, glyph, aaCircle, transparentLogo, bakedCheckerLogo); objetivos: pajaro 0.096 (el fondo blanco es el 86.5 % del área
+    etiquetada), gradientFeathers ±3 0.108, radialDisc 0.443, diagonalSweep 0.542. 0.05 es la mitad del menor. En la rama foto no se exige: allí
+    falló la paleta exacta y regiones planas bien explicadas ya bastan.
+  · `GRADIENT_MAX_EDGE_SHARE` 0.6, el límite de fallback del pipeline (un test fija que son iguales; no se importa porque pipeline importa
+    classify): objetivos ≤ 0.368 (radialDisc); eagle 0.633, donde el modo Degradados cae a la paleta plana (fidGrad 0.8999 < 0.9000). Como el
+    pipeline, el sondeo no ajusta nada por encima (explained 0): eagle 65 → 14 ms, splash 127 → 13, noisePhoto(256) 98 → 12, y el aviso photo
+    no sugiere Degradados donde caería al fallback (ajustando, eagle daba explained 0.989).
+  · `GRADIENT_MIN_EXPLAINED` 0.85, el provisional: objetivos ≥ 0.988 (pajaro); el mayor por debajo con bordes ≤ 0.6 es Instagram 0.294, que en
+    gradient empeora (0.8684 < 0.9395) y debe seguir photo. Todo valor en (0.294, 0.988] separa la tabla; 0.85 deja 0.138 de margen al pájaro.
+  · `GRADIENT_MAX_REGIONS` 400, el provisional: no decide ninguna fila (la mayor cuenta ajustada es 39, pajaro; las de 179-466 de clip_art,
+    eagle, splash y noisePhoto(256) caen antes por bordes), así que se conserva el valor del plan. `GRADIENT_SUGGEST_EXPLAINED` 0.5, el del
+    plan: con el límite de bordes ninguna muestra del bench lo alcanza en la rama foto (Instagram 0.294, eagle, splash y noisePhoto 0).
+  · Tiempo (objetivo del plan: ≤ 60 ms en el proxy). Con maxStops 8 Instagram tardaba 111-122 ms en su proxy de 480×270: dos regiones
+    complejas multicolor (21 119 y 10 459 píxeles de núcleo) cuestan 45 + 41 ms de fitLinear, sin depender del número de píxeles (ajustando sobre
+    una retícula de paso 2, 3 o 4: 36-51 ms), así que submuestrear no sirve (probado y retirado). Barrido maxStops × lado del proxy en las 14
+    filas: con 8, 6 y 4 paradas TODOS los valores del sondeo son idénticos y el tiempo baja (Instagram 111 / 69 / 45 ms, gradientFeathers ±3
+    53.5 / 50.5 / 27.5, pajaro 54.1 / 53.6 / 48.7); un lado de 384 o 256 px cambia los valores (pajaro explained 0.985 / 0.952, Instagram 7 /
+    21 regiones) y no acelera Instagram (384 px con 8 paradas: 201 ms). Elegidos `GRADIENT_PROBE_MAX_STOPS` 4 y `GRADIENT_PROBE_MAX_SIDE` 512:
+    máximo 49.5 ms (pajaro), Instagram 43.5, gradientFeathers ±3 27.5. Con la imagen completa (componer y reducir 16 Mpx) pajaro 180 ms e
+    Instagram 114.
+  · `explained` sigue la definición del encargo (rmse ≤ max(2.5, 2σ)); el comentario de `GradientProbe.explained` en types.ts dice "no complex"
+    y el de `SourceInfo.gradientProbe` "solo en la rama foto": difieren en regiones complex con rmse ≤ esa cota (cuentan) y sólidas de núcleo
+    < 64 px con rmse mayor (no cuentan), y en la rama del sondeo (arriba). Pendiente de actualizar por quien lleve types.ts.
+  · pajaro, conteo sobre la fuente (recortes a resolución completa): 12 plumas (5 del ala izquierda, 3 del ala derecha, 1 del vientre, 3 de la
+    cola) y 6 formas más con degradado (cuello y cuerpo, franja del cuello, cabeza, brillo de la cabeza, banda púrpura, vientre oscuro) = 18
+    formas con degradado; con 12 sombras azul marino y el fondo, 31 formas. SVG en Auto: 33 capas = fondo + 12 azul marino (#013780) + 19
+    `<linearGradient>` (las 18 formas; el cuello corta la pluma verde amarillenta en dos piezas) + una mota verde sólida de 13 px; 0 radiales.
+    Bench: 19 `<linearGradient>` ≥ ceil(0.9 · 18) = 17; 33 capas ≤ 1.5 · 31 = 46.5. Motivos: "El 99 % de los píxeles se explica con 39 regiones
+    de color plano o degradado (el 10 % con degradados): se vectoriza en modo Degradados." y "Sus 19 colores planos cubren la imagen, pero
+    partirían cada degradado en bandas de color."
+  · pajaro, fidelidad: "≥ MEASURED anterior + 0.02" es inalcanzable (0.981 + 0.02 = 1.001 > 1). Medido 0.9956 (+0.0146): el bench exige la
+    ganancia más estrecha alcanzada, +0.014, además de ≥ 0.97 y del suelo MEASURED, que pasa a 0.996 / 0.995 (IoU 0.959 → 0.995). eagle,
+    Instagram y splash siguen en photo con sus filas MEASURED intactas (en gradient 0.8999 / 0.8684 / 0.8881 frente a 0.9000 / 0.9395 / 0.8973);
+    el bench fija además su modo flat.
+  · Bench (potrace), fase 7 (la columna modo se ensanchó a 8):
+    ```
+    image                            dims  mode      U      ms  layers  paths   nodes  corner  naive     bytes  fidel   ssim    iou    mae  pct16  warnings
+    GENTERA                     1561x1672  flat      2    1036       6      9    1853   0.012  0.095     70527  0.999  1.000  0.999    0.0  0.001  -
+    Instagram                   3840x2160  flat      1     910      12   4477   60446   0.020  0.020   2391810  0.940  0.991  0.862    1.6  0.138  photo
+    clip_art                      290x193  flat      4      96       2     55     678   0.080  0.085     22664  0.960  0.993  0.910    1.2  0.090  baked-checkerboard
+    eagle                         350x350  flat      4     358      14    316   22702   0.042  0.057    772116  0.900  0.983  0.776    2.9  0.224  photo
+    Compartamos avatar            800x800  flat      2     288       3     44    1027   0.167  0.302     33362  0.995  0.999  0.988    0.2  0.012  -
+    pajaro                      4001x4001  gradient  1    3308      33     46     836   0.089  0.092     37492  0.996  0.996  0.995    0.4  0.005  large-input
+    splash                        740x740  flat      2     443      16   2675   36945   0.058  0.068   1268085  0.897  0.950  0.818    2.6  0.182  baked-checkerboard,photo
+    ```
+
+- Degradados, revisión de hallazgos (`src/core/edges.ts`, `regions.ts`, `fillModel.ts`, `fillEval.ts`, `pipeline.ts`, `classify.ts`,
+  `src/svg/assemble.ts`, `src/ui/warnings.ts`, README, tests; `tests/fixtures/gradientCases.ts` nuevo), 2026-09-11. Flat, lines y pixel sin
+  cambios: en el bench GENTERA, Instagram, clip_art, eagle, avatar y splash dan las mismas filas que en la fase 7 (salvo ms). Cada hallazgo
+  tiene su test, que fallaba antes del arreglo con las cifras "antes".
+  · Rampas empinadas (edges.ts, alta): la histéresis del Sobel inundaba una rampa de pendiente s ≥ sobLo/2 = 4.8 niveles/px (Sobel 2s) desde su
+    contorno AA. `gateSobel` (contrato en edges.ts): un píxel débil sigue en la histéresis solo cerca de actividad del laplaciano
+    (`SOBEL_GATE_RADIUS` 1) o si destaca de su entorno (Sobel − mínimo a `SOBEL_CONTRAST_RADIUS` 2 px > sobLo); si no, 0. El capado a sobLo en
+    Float32 quedaba por encima del umbral double (9.6000004 > 9.6): se usa 0. Variantes medidas (edgeShare / regiones / complejas por área /
+    núcleo del interior de steepRamp(24)), laplaciano a radio L y contraste a radio C (−1 = sin esa prueba):
+    ```
+    variante        gradientFeathers  bicúbico ×8 (f 2)            radialDisc  noisePhoto(64)        steepRamp(24)
+    sin puerta      0.119 / 23        10 reg, 8 lineales            0.368       0.931 / 23            0 / 1892
+    L1, C−1         0.119 / 23        plumas 3 y 4 fundidas (6.5)   0.113       0.411 / 19, 0.91      1476 / 1892
+    L2, C−1         0.119 / 23        fundidas                      0.134       0.636 / 27, 0.73      1280 / 1892
+    L−1, C3         0.119 / 23        12 reg, 8 lineales            0.090       0.292 / 7, 0.97       1680 / 1892
+    L1, C2 (elegida) 0.119 / 23       12 reg, 8 lineales            0.113       0.438 / 19, 0.91      1476 / 1892
+    ```
+    El laplaciano solo no ve el contacto suave 3/4 del bicúbico (sus lóbulos quedan a 2-3 px); el contraste lo separa. steepRamp(w) forzado
+    a gradient: w 24 RMSE interior 202.9 → 0.29 (fidelidad 0.2784 → 0.9775; flat 0.9606), w 36 203.1 → 0.40 (0.2674 → 0.9813; flat 0.9525),
+    núcleo del interior 0.780 / 0.841 / 0.892 para w 24 / 36 / 48 (test ≥ 0.75 / 0.8 / 0.85). radialDisc(128): edgeShare 0.368 → 0.113, el
+    núcleo ya abarca el anillo y la regla de banda profunda de la fase 6 no se activa.
+  · Trazos finos (regions.ts, alta): una barra de ≤ 5 px no tenía núcleo y el crecimiento por color la daba al fondo. Huérfanos: el crecimiento
+    guarda de qué píxel core partió cada píxel; los que difieren de él más de `ORPHAN_STEP_RATIO`·sobHi (48) y no son mezcla de los primeros
+    píxeles core que alcanzan sus 8 rayos (`ORPHAN_RAY_LENGTH` 8) salen de la región en grupos de ≥ `ORPHAN_MIN_AREA` 16 px; con núcleo fino
+    (píxeles que no son mezcla de sus vecinos en x ni en y a `THIN_BLEND_RATIO`·sobHi = 12; si no queda ninguno, todos). Sin el mínimo de 16
+    px, los píxeles AA donde se juntan tres colores (no son mezcla de dos) formaban regiones de 1-3 px cuyos colores, fundidos en el fondo,
+    volvían complejo el fondo del sondeo (explained 1 → 0.058 en feathersWithBars). thinBars: núcleo por barra 0 → 100 / 200 / 300 / 400 en
+    las de 2-5 px, media de R en sus columnas cubiertas 255 → 20.2-20.9 (tinta 20), fidelidad 0.7709 → 0.9885 (= flat); los puntos de 3×3
+    px siguen absorbidos (9 < 16) y los de 5×5 son regiones. Límite: un trazo cuyo color es mezcla de lo que lo rodea (gris entre blanco y
+    negro) sigue absorbido. Toda región tiene ahora algún píxel core (también las sobrantes aisladas por transparencia).
+  · Semitransparentes (regions.ts, alta): `CORE_MIN_ALPHA` 250 → 128 y el canal alfa entra en `rgbEdgeMaps` con transparencia (el borde AA de
+    una forma sobre transparencia es borde; su interior de alfa plano, núcleo). semiTransparentDisc (#ff8800, alfa 200): capa #000000 → #ff8800,
+    centro 0,0,0,255 → 255,136,0,255 (= flat). transparentLogo(64) en gradient: 1 capa, IoU del alfa 0.9929 (igual).
+  · Sondeo (classify.ts, alta): `explained` descuenta los píxeles ajenos de cada región aceptada (a ≥ `GRADIENT_PROBE_INTERIOR_RADIUS` 2 px de
+    otra etiqueta y a más de `GRADIENT_PROBE_FOREIGN_RATIO`·sobHi = 48 niveles de su modelo) y vale 0 si las complex superan
+    `GRADIENT_MAX_COMPLEX_SHARE` 0.5 (el límite del pipeline, test de igualdad). 1089 px de puntos 3×3 absorbidos en 128²: explained 1 →
+    0.93353 (= 1 − 1089/16384). Los casos Auto del hallazgo: feathersWithBars gradient, RMSE de las barras 215.5 → 3.15, fidelidad 0.9116 →
+    0.9969 (flat 0.9415); feathersWithRampButton gradient, RMSE del botón 170.9 → 0.49, fidelidad 0.9774 → 0.9989 (flat 0.9445);
+    gradientRectsWithSemiDisc gradient, centro del disco 0,0,0,255 → 255,136,0,255.
+  · Bajo contraste (edges.ts, media): un escalón localizado (contraste > sobLo, Sobel 0.775·Δ tras el predesenfoque) siembra la histéresis
+    (+Infinity) si no hay un píxel fuerte a ≤ `SOBEL_SEED_CLEARANCE` 3 px. Sin esa distancia las semillas cortaban 3 puntas de pluma de
+    gradientFeathers(256) (13 capas). lowContrastShapes / lowContrastDisc forzados a gradient (capas; RMSE de las formas interiores; fidelidad;
+    flat entre paréntesis):
+    ```
+    Δ    cuadrado con rombo y cuadrado                          disco concéntrico
+    12   2 capas (#3262c2 plano); 10.00; 0.9819 (0.9862)        2 capas, radial falso; 0.47; 0.9946 (0.9878)
+    20   4 capas planas; 0.17; 0.9951 (0.9916)                  3 capas planas; 0.04; 0.9951 (0.9916)
+    28   4 capas planas; 0.25; 0.9951 (0.9901)                  3 capas planas; 0.07; 0.9951 (0.9901)
+    40   4 capas planas; 0.36; 0.9950 (0.9846)                  3 capas planas; 0.08; 0.9951 (0.9847)
+    ```
+    Antes, Δ 20 y 28: 2 regiones (una capa con la media, RMSE 17 / 24, o un radial falso). Límite: Δ 12 da Sobel 9.3 < sobLo 9.6 y sigue sin
+    separarse; bajar sobLo es bajar el umbral del plan.
+  · Fusiones (fillModel.ts, media): con una muestra por paso (> `MERGE_MAX_JOINT_PIXELS`) fitRadial no encontraba soportes 9×9 y el ajuste
+    conjunto nunca era radial; ahora lee los soportes de seg.core y las regiones del par. Las dos mitades de radialDisc(512) (radial rmse 0.43
+    y 0.42): planMerges [] → [[2, 1]]; splitRadialDisc() en el pipeline: 1 <radialGradient> (la columna elevada, una línea real de 1 px, queda
+    en sus capas finas; 5 capas, fidelidad 0.9965). Un grupo con < 64 px de núcleo (sólido por la escalera) que falla el salto se funde si el
+    modelo conjunto explica su núcleo con RMSE ≤ max(rmse) + 1.5: la punta de la pluma 5 (72 px, núcleo 3, RMSE conjunto 1.90 ≤ 0.82 + 1.5).
+    Como alternativa y no como sustituto del salto: sustituirlo dejaba sin fundir 3 puntas cuyo salto sí pasaba (RMSE 1.80-2.00 > 1.80).
+    Coste: ese ajuste conjunto (hasta 32 768 píxeles, repetido tras cada fusión del vecino) llevó el sondeo del avatar de 36 a 2236 ms y el de
+    noisePhoto(256) a 41 s. Antes del ajuste, `MERGE_SMALL_MAX_OFFSET` 24 (el suelo Sobel): el RMSE del modelo del vecino extrapolado sobre el
+    núcleo del grupo pequeño; medido 0.31 en la punta de la pluma 5 frente a 114-168 en los otros 17 candidatos de gradientFeathers(256) y
+    177-179 en los 117 del avatar. Exigir ahí max(rmse) + 1.5 dejaba 4 fragmentos de pajaro sin fundir (37 capas); un ajuste solo con los
+    píxeles vecinos (margen de 16 px) rechazaba la punta de la pluma 5 (11 capas) y seguía costando 719 ms en el avatar. Con el umbral de 24:
+    avatar 54 ms, pajaro 33 capas. Además el sondeo y el pipeline comprueban la fracción de complejas tras el primer ajuste y no ejecutan
+    planMerges por encima de 0.5 (las complejas no se vuelven explicadas al fundirse): noisePhoto(256) 41 s → 52 ms. Aun así el sondeo de
+    pajaro tardaba 81.5 ms en su proxy de 501² (el plan: ≤ 60; medianas de 5: segmentEdges 15, del que 10 son el predesenfoque, segmentRegions
+    9.7, modelos 18, planMerges 17, reajuste de las fusionadas): el sondeo pasa `smallGroups: false` a planMerges (esos fragmentos son sólidos y
+    cuentan como explicados igual) y baja a 57.4 ms con los mismos valores salvo regiones 38 → 41.
+  · Tabla del sondeo tras la revisión (`BENCH=1 npx vitest run tests/bench/gradientProbe.test.ts`, mismas columnas que en la fase 7; la
+    ejecución completa pasa de 538 s a 27 s porque noisePhoto(256) ya no ajusta 15-41 s):
+    ```
+    image                      dims   f   pal  offSh  sondeo  sigma   edge    reg   expl    lin    rad    pxMs  fullMs  modo      fidAuto  fidGrad  trazado gradient
+    GENTERA               1561x1672   4     6  0.001  no      0.000  0.076      6  1.000  0.000  0.000    21.8      76  flat       0.9993   0.9996  6 capas, 0 lin
+    Instagram             3840x2160   8  null  0.100  sí      0.118  0.197      6  0.000  0.000  0.000    46.7     120  flat*      0.9395   0.9402  fallback, 12 capas
+    clip_art                290x193   1     2  0.041  no      1.052  0.927     58  0.000  0.000  0.000     5.6       9  flat       0.9597   0.9566  fallback, 2 capas
+    eagle                   350x350   1  null  0.260  sí      0.465  0.684    372  0.000  0.000  0.000    18.3      18  flat*      0.9000   0.8999  fallback, 14 capas
+    Compartamos avatar      800x800   2     3  0.010  no      0.013  0.145     37  0.999  0.000  0.000    34.7      64  flat       0.9946   0.9965  35 capas, 0 lin
+    pajaro                4001x4001   8    19  0.015  sí      0.018  0.090     41  0.988  0.096  0.000    57.4     189  gradient   0.9982   0.9982  33 capas, 19 lin
+    splash                  740x740   2  null  0.161  sí      1.166  0.770    409  0.000  0.000  0.000    16.1      21  flat*      0.8973   0.8993  fallback, 16 capas
+    gradientFeathers        256x256   1  null  0.095  sí      0.011  0.119     11  1.000  0.110  0.000    15.9      16  gradient        -        -
+    radialDisc              128x128   1     9  0.031  sí      0.092  0.113      2  1.000  0.000  0.443     6.3       6  gradient        -        -
+    diagonalSweep           128x128   1     9  0.017  sí      0.162  0.091      2  1.000  0.542  0.000     9.5      10  gradient        -        -
+    gradientFeathers ±3     256x256   1    19  0.029  sí      0.796  0.118     13  1.000  0.108  0.000    29.9      28  gradient        -        -
+    noisePhoto               64x64    1  null  0.782  sí      0.198  0.451     20  0.000  0.000  0.000     7.0       8  flat*           -        -
+    noisePhoto(256)         256x256   1     7  0.823  sí      0.200  0.395    228  0.000  0.000  0.000    46.4      47  flat*           -        -
+    flatShapes3              96x96    1     3  0.008  no      0.000  0.121      3  1.000  0.000  0.000     1.1       1  flat            -        -
+    ```
+    Frente a la fase 7: Instagram forzado a gradient cae por complejas (fidGrad 0.8684 → 0.9402) y splash también (0.8881 → 0.8993); eagle
+    sigue cayendo por bordes (0.684); los modos Auto no cambian. noisePhoto queda bajo el límite de bordes y su explained 0 viene de las
+    complejas.
+  · Extensión de los degradados (pipeline.ts): con la inundación corregida el núcleo termina 2-3 px antes del contorno y r quedaba corto
+    (radialDisc r 44.14 frente a 48, 8.0 %, test ≤ 5 %). `extendGradient` sobre la banda profunda de cada región, solo si baja su RMSE:
+    r 46.72 (2.7 %), 3 paradas, fidelidad 0.9984; gradientFeathers(256) 10 capas, fidelidad 0.9986, RMSE de núcleo por forma 0.36-0.58
+    (antes 1.01-1.52).
+  · Fallback por complejas (pipeline.ts): noisePhoto solo caía por bordes gracias a la inundación (0.93); con la puerta es 44 % borde y
+    `GRADIENT_MAX_COMPLEX_SHARE` 0.5 lo devuelve a la paleta plana ("el 92 % de la imagen no se explica con colores planos ni degradados"): sin
+    él, gradient daba fidelidad 0.3466 / 0.2867 (64 / 256 px) frente a 0.6517 / 0.6078 en flat. En la fase 6 las complejas eran el 70.7 % de
+    Instagram y el 64 % de splash forzados, que ya trazaba peor que flat; pajaro 1.2 %.
+  · Fallback por bordes antes de etiquetar (pipeline.ts, baja): `segmentEdges` separa la etapa de bordes. Bloques aleatorios de 4 px en
+    2000²: fitGradientRegions cae por bordes (100 %) en 781 ms (segmentEdges 670 ms); segmentRegions sobre esos bordes habría sumado 775 ms.
+    noisePhoto(2000) cae ahora por regiones (12 970 crudas > 2000) en 1101 ms, sin ajustar modelos.
+  · JPEG (baja, arreglo parcial): gradientFeathers(512) guardado con `sips` en JPEG y vuelto a PNG, forzado a gradient:
+    ```
+    calidad  σ̂      crudas  capas (antes)  modelos                                          fidelidad  Auto (explained)
+    PNG      0.013  11      10             8 lineales, 2 sólidos                            0.9995     gradient (1.000)
+    q90      0.093  12      10 (10)        8 lineales, 2 sólidos                            0.9880     gradient (1.000)
+    q75      0.115  17      10 (12)        5 lineales, 3 lineales y 1 sólido complejos       0.9873     gradient (0.960)
+    q50      0.072  113     33 (65)        21 sólidos, 11 lineales y 1 sólido complejos      0.9792     gradient (0.885)
+    ```
+    La mejora viene de las fusiones de fragmentos pequeños. El estimador de Immerkær no ve el error JPEG (dentro de cada bloque es de baja
+    frecuencia y cerca de los bordes queda excluido); su versión alineada con la rejilla de 8 px da, en σ de las posiciones de frontera /
+    interiores, q50 0.161 / 0.114 (×1.41), q75 ×1.22, q90 ×1.15, y ×1.25 en diagonalSweep limpio, ×1.95 en clip_art: no separa el JPEG del
+    contenido, así que no se usa para escalar umbrales. Límite conocido: a q50 quedan 3.3 capas por forma y las plumas complejas.
+  · Tests (hallazgos de tests): gradientFeathers(256) exige exactamente 10 capas (formas + fondo), una etiqueta principal distinta por capa y
+    ≥ 0.97 de los píxeles de cada etiqueta en su capa (antes 11: la pluma 5 en una capa lineal y 73 px de su punta en una sólida); costuras en
+    los píxeles de contacto entre formas: 3 / 159 a más de 40 niveles (test ≤ 8), 0 blancos; el control con máscaras erosionadas da 18 / 159
+    (2 px a U 4) y 152 / 159 (6 px), y la prueba antigua de núcleo daba 0 / 5473 en los tres casos.
+  · pajaro (bench): el marco negro de 1 px del original (fila 0 de img/pajaro.jpg incluida) quedaba en el fondo #fefefe. Con los huérfanos es
+    una región del proxy (f 3) de 1 px, ajustada en su gris promediado (degradado #a9a9a9 → #7f7f7f); en el proxy, una región sin ningún
+    píxel cuyo 3×3 sea todo suyo pasa a sólido del color medio de los píxeles de up que refineLabels le da, y se vuelve a etiquetar: #040404,
+    anillo 16 000 / 16 000 → 0 / 16 000 píxeles a más de 40 niveles (test ≤ 1 %; en 2048² con f 2: 8192 → 0). Un trazo fino con degradado a
+    lo largo pierde el degradado en un proxy (límite). El vientre oscuro sigue siendo la única región compleja: RMSE interior (≥ 4 px de otra
+    capa) 8.84, p99 26 (sombreado 2-D que ni lineal ni radial explican; splitComplex sigue sin implementar); las otras 32 capas ≤ 1.53. El
+    bench fija ≤ 1 capa sobre 2.5 y esa ≤ 8.9, el marco ≤ 1 %, 17 ≤ <linearGradient> ≤ 20, y que un degradado de dos colores (a ≤ 3 niveles)
+    tiene 2 paradas. `PAJARO_SHAPES` 31 → 32 (el marco). Fidelidad 0.9956 → 0.9982, IoU 0.995 → 0.996; `PAJARO_MIN_GAIN` 0.014 → 0.017.
+  · Paradas planas en los extremos (fillModel.ts, README): 6 de los 19 degradados de pajaro salían con 3-4 paradas repitiendo un color. Se
+    quitan las paradas extremas a ≤ `FLAT_END_TOL_FACTOR` 2·ε niveles por canal de su vecina y el extremo del degradado se mueve a la que queda
+    (el pad pinta lo mismo). Con 1·ε una rampa radial plana en sus 12 px centrales conservaba 3 paradas (1.67 niveles de diferencia). pajaro:
+    todos los degradados de dos colores tienen 2 paradas; el vientre 4 (colores distintos).
+  · Paradas duras (fillEval.ts, baja): `normalizeStops` conserva dos paradas en un mismo offset; el test del hallazgo (4 paradas, 64×32 sobre
+    256×128) pasa de 3 paradas escritas y diferencia máxima 251 a 4 y ≤ 1 nivel entre el SVG y renderLayersAt1x.
+  · Ids (assemble.ts, media): `g<h>-<n>` con h = FNV-1a del documento con ids g0, g1…; SVGO (`cleanupIds` desactivado) los conserva.
+  · Aviso photo en Degradados (warnings.ts, baja): `mergeWarnings` lo descarta en modo gradient. README: la fila Auto describe también la rama
+    de paleta exacta con ≥ 8 colores.
+  · Bench (potrace), tras la revisión (tabla del sondeo de la fase 7 actualizada abajo):
+    ```
+    image                            dims  mode      U      ms  layers  paths   nodes  corner  naive     bytes  fidel   ssim    iou    mae  pct16  warnings
+    GENTERA                     1561x1672  flat      2    1030       6      9    1853   0.012  0.095     70527  0.999  1.000  0.999    0.0  0.001  -
+    Instagram                   3840x2160  flat      1    1032      12   4477   60446   0.020  0.020   2391810  0.940  0.991  0.862    1.6  0.138  photo
+    clip_art                      290x193  flat      4     206       2     55     678   0.080  0.085     22664  0.960  0.993  0.910    1.2  0.090  baked-checkerboard
+    eagle                         350x350  flat      4     433      14    316   22702   0.042  0.057    772116  0.900  0.983  0.776    2.9  0.224  photo
+    Compartamos avatar            800x800  flat      2     280       3     44    1027   0.167  0.302     33362  0.995  0.999  0.988    0.2  0.012  -
+    pajaro                      4001x4001  gradient  1    4672      33     47     831   0.103  0.107     36887  0.998  0.999  0.996    0.1  0.004  large-input
+    splash                        740x740  flat      2     453      16   2675   36945   0.058  0.068   1268085  0.897  0.950  0.818    2.6  0.182  baked-checkerboard,photo
+    ```
+
 ## Worker
 `src/workers/protocol.ts` (mensajes), `handler.ts` (lógica pura y testeable en Node), `trace.worker.ts` (envoltorio fino:
 único módulo que importa los trazadores wasm —esm-potrace-wasm parchea TextDecoder globalmente— y
@@ -1068,6 +1917,10 @@ export function outranks(a: Standing, b: Standing, fidelityFloor: number): boole
 // TuneResult añade baseline y tuned (TuneSummary)
 export function maskPerimeter(mask: BinaryMask): number
 export function renderLayersAt1x(layers: Layer[], U: number, width: number, height: number, background: RGB): RasterImage
+// Degradados: renderLayersAt1x escala también layer.gradient por 1/U (scaleGradient); prepare() usa prepareForMode salvo en gradient, donde
+// memoiza fitGradientRegions por imagen (la fuente o su proxy, WeakMap del contexto) con clave background|regionDetail|maxStops|radialGradients
+// y llama a prepareGradient(img, resolved, info, fit): los candidatos que solo cambian U, desenfoque o potrace no vuelven a segmentar.
+// traceLayers, isFullMask y layerMask vienen de core/pipeline; comparisonBackground trata gradient como flat.
 ```
 
 ## Notas de entorno para tests

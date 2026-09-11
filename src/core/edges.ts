@@ -271,3 +271,247 @@ function allBlocksConstant(px: Uint32Array, w: number, h: number, k: number): bo
   }
   return true;
 }
+
+// ---------------------------------------------------------------------------------------------
+// Gradient mode (phase 1): RGB edge maps, hysteresis and noise-scaled thresholds
+// ---------------------------------------------------------------------------------------------
+
+export interface EdgeMaps {
+  sobel: GrayImage;
+  laplacian: GrayImage;
+}
+
+/**
+ * Edge maps of an RGBA image, per channel R, G and B (and alpha when `withAlpha`; ignored otherwise), with
+ * replicated borders, keeping the largest channel at every pixel:
+ *   sobel     = sqrt(gx² + gy²) with each component divided by 4 (a clean 0 -> 255 step gives 255, as
+ *               sobelMagnitude; a ramp of slope s gives 2s);
+ *   laplacian = |convolution with [[1,1,1],[1,-8,1],[1,1,1]]| / 8: 0 on any linear ramp (so a gradient
+ *               has none), a peak on both sides of an anti-aliased edge.
+ * Same size as img.
+ */
+export function rgbEdgeMaps(img: RasterImage, withAlpha = false): EdgeMaps {
+  const { width: w, height: h } = img;
+  const n = w * h;
+  const d = img.data;
+  if (d.length < n * 4) throw new RangeError('rgbEdgeMaps: data.length < width·height·4');
+  const sob = new Float32Array(n);
+  const lap = new Float32Array(n);
+  const channels = withAlpha ? 4 : 3;
+  for (let y = 0; y < h; y++) {
+    const ym = (y > 0 ? y - 1 : 0) * w;
+    const y0 = y * w;
+    const yp = (y < h - 1 ? y + 1 : h - 1) * w;
+    for (let x = 0; x < w; x++) {
+      const xm = x > 0 ? x - 1 : 0;
+      const xp = x < w - 1 ? x + 1 : w - 1;
+      const oTl = (ym + xm) * 4;
+      const oTc = (ym + x) * 4;
+      const oTr = (ym + xp) * 4;
+      const oMl = (y0 + xm) * 4;
+      const oMc = (y0 + x) * 4;
+      const oMr = (y0 + xp) * 4;
+      const oBl = (yp + xm) * 4;
+      const oBc = (yp + x) * 4;
+      const oBr = (yp + xp) * 4;
+      let s2 = 0;
+      let l = 0;
+      for (let c = 0; c < channels; c++) {
+        const tl = d[oTl + c];
+        const tc = d[oTc + c];
+        const tr = d[oTr + c];
+        const ml = d[oMl + c];
+        const mr = d[oMr + c];
+        const bl = d[oBl + c];
+        const bc = d[oBc + c];
+        const br = d[oBr + c];
+        const gx = tr + 2 * mr + br - tl - 2 * ml - bl;
+        const gy = bl + 2 * bc + br - tl - 2 * tc - tr;
+        const g2 = gx * gx + gy * gy;
+        if (g2 > s2) s2 = g2;
+        let lc = tl + tc + tr + ml + mr + bl + bc + br - 8 * d[oMc + c];
+        if (lc < 0) lc = -lc;
+        if (lc > l) l = lc;
+      }
+      sob[y0 + x] = Math.sqrt(s2) * 0.25;
+      lap[y0 + x] = l * 0.125;
+    }
+  }
+  return { sobel: { data: sob, width: w, height: h }, laplacian: { data: lap, width: w, height: h } };
+}
+
+/**
+ * Hysteresis thresholding: 1 where mag > hi, or mag > lo and 8-connected (through pixels > lo) to a
+ * pixel > hi. Flood fill with an explicit Int32Array stack (grown on demand, each pixel pushed at most
+ * once), no recursion. NaN never passes either threshold.
+ */
+export function hysteresis(mag: Float32Array, width: number, height: number, lo: number, hi: number): BinaryMask {
+  const w = width;
+  const h = height;
+  const n = w * h;
+  if (mag.length < n) throw new RangeError('hysteresis: mag.length < width·height');
+  const out = new Uint8Array(n);
+  let stack = new Int32Array(Math.max(1, Math.min(n, 1 << 16)));
+  let top = 0;
+  for (let i = 0; i < n; i++) {
+    if (out[i] !== 0 || !(mag[i] > hi)) continue;
+    out[i] = 1;
+    stack[top++] = i;
+    while (top > 0) {
+      const p = stack[--top];
+      const x = p % w;
+      const y = (p - x) / w;
+      const xa = x > 0 ? x - 1 : 0;
+      const xb = x < w - 1 ? x + 1 : x;
+      const ya = y > 0 ? y - 1 : 0;
+      const yb = y < h - 1 ? y + 1 : y;
+      for (let yy = ya; yy <= yb; yy++) {
+        const row = yy * w;
+        for (let xx = xa; xx <= xb; xx++) {
+          const q = row + xx;
+          if (out[q] !== 0 || !(mag[q] > lo)) continue;
+          out[q] = 1;
+          if (top === stack.length) {
+            const grown = new Int32Array(Math.min(n, stack.length * 2));
+            grown.set(stack);
+            stack = grown;
+          }
+          stack[top++] = q;
+        }
+      }
+    }
+  }
+  return { data: out, width: w, height: h };
+}
+
+export interface EdgeThresholds {
+  lapHi: number;
+  lapLo: number;
+  sobHi: number;
+  sobLo: number;
+}
+
+/** Laplacian (÷8) floor of the strong threshold, levels: the plan's measurement on the clean bird. */
+const LAP_HI_MIN = 6;
+/** Strong Laplacian threshold per level of noise sigma: 1.8 · 4σ. */
+const LAP_HI_PER_SIGMA = 1.8 * 4;
+const LAP_LO_RATIO = 0.45;
+/** Sobel (÷4) floor of the strong threshold, levels. */
+const SOB_HI_MIN = 24;
+const SOB_HI_PER_SIGMA = 9;
+const SOB_LO_RATIO = 0.4;
+
+/**
+ * Edge thresholds scaled by the noise estimate σ (immerkaerSigma, levels) and divided by regionDetail
+ * (above 1: lower thresholds, more edges, more regions):
+ *   lapHi = max(6, 1.8·4σ) / regionDetail; lapLo = 0.45·lapHi; sobHi = max(24, 9σ) / regionDetail; sobLo = 0.4·sobHi.
+ * A non-finite or negative σ counts as 0; a non-finite or non-positive regionDetail as 1.
+ * The edge mask is hysteresis(laplacian, lapLo, lapHi) ∪ hysteresis(sobel, sobLo, sobHi).
+ */
+export function edgeThresholds(sigma: number, regionDetail: number): EdgeThresholds {
+  const s = Number.isFinite(sigma) && sigma > 0 ? sigma : 0;
+  const detail = Number.isFinite(regionDetail) && regionDetail > 0 ? regionDetail : 1;
+  const lapHi = Math.max(LAP_HI_MIN, LAP_HI_PER_SIGMA * s) / detail;
+  const sobHi = Math.max(SOB_HI_MIN, SOB_HI_PER_SIGMA * s) / detail;
+  return { lapHi, lapLo: LAP_LO_RATIO * lapHi, sobHi, sobLo: SOB_LO_RATIO * sobHi };
+}
+
+/** Radius (px, Chebyshev) of the Laplacian activity that lets a weak Sobel pixel into the hysteresis (gateSobel). */
+export const SOBEL_GATE_RADIUS = 1;
+/**
+ * Radius (px, Chebyshev) of the window whose smallest Sobel value a weak pixel must exceed by sobLo (gateSobel): a soft
+ * step (a bicubic-upscaled boundary, 4-6 px wide) has its low surroundings within 2 px of its centre.
+ */
+export const SOBEL_CONTRAST_RADIUS = 2;
+/**
+ * A weak step seeds the Sobel hysteresis only farther than this (px, Chebyshev) from every strong pixel (gateSobel):
+ * next to a strong edge the hysteresis already reaches it, and seeds there cut the narrow tips of shapes, whose
+ * anti-aliased sides are weak and stand out (gradientFeathers(256): 3 tips became regions of their own).
+ */
+export const SOBEL_SEED_CLEARANCE = 3;
+
+export function gateSobel(
+  sobel: Float32Array,
+  laplacian: Float32Array,
+  width: number,
+  height: number,
+  t: EdgeThresholds,
+  lapRadius: number = SOBEL_GATE_RADIUS,
+  contrastRadius: number = SOBEL_CONTRAST_RADIUS,
+): Float32Array {
+  const w = width;
+  const h = height;
+  const n = w * h;
+  if (sobel.length < n || laplacian.length < n) throw new RangeError('gateSobel: map length < width·height');
+  const out = new Float32Array(n);
+  const rl = lapRadius >= 0 ? Math.floor(lapRadius) : -1;
+  const rc = contrastRadius >= 0 ? Math.floor(contrastRadius) : -1;
+  const rs = SOBEL_SEED_CLEARANCE;
+  const { sobLo, sobHi, lapLo, lapHi } = t;
+  // The windows are read only around weak pixels (a minority), with early exits: the same clipped squares as a
+  // separable minimum / maximum filter over the whole image, at a fraction of the cost.
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      const v = sobel[i];
+      if (!(v > sobLo) || v > sobHi) {
+        out[i] = v;
+        continue;
+      }
+      let localized = false;
+      if (rc >= 0) {
+        const floor = v - sobLo;
+        const y0 = y > rc ? y - rc : 0;
+        const y1 = y + rc < h ? y + rc : h - 1;
+        const x0 = x > rc ? x - rc : 0;
+        const x1 = x + rc < w ? x + rc : w - 1;
+        for (let yy = y0; yy <= y1 && !localized; yy++) {
+          const row = yy * w;
+          for (let xx = x0; xx <= x1; xx++) {
+            if (sobel[row + xx] < floor) {
+              localized = true;
+              break;
+            }
+          }
+        }
+      }
+      if (localized) {
+        let near = false;
+        const y0 = y > rs ? y - rs : 0;
+        const y1 = y + rs < h ? y + rs : h - 1;
+        const x0 = x > rs ? x - rs : 0;
+        const x1 = x + rs < w ? x + rs : w - 1;
+        for (let yy = y0; yy <= y1 && !near; yy++) {
+          const row = yy * w;
+          for (let xx = x0; xx <= x1; xx++) {
+            const j = row + xx;
+            if (sobel[j] > sobHi || laplacian[j] > lapHi) {
+              near = true;
+              break;
+            }
+          }
+        }
+        out[i] = near ? v : Number.POSITIVE_INFINITY;
+        continue;
+      }
+      let active = false;
+      if (rl >= 0) {
+        const y0 = y > rl ? y - rl : 0;
+        const y1 = y + rl < h ? y + rl : h - 1;
+        const x0 = x > rl ? x - rl : 0;
+        const x1 = x + rl < w ? x + rl : w - 1;
+        for (let yy = y0; yy <= y1 && !active; yy++) {
+          const row = yy * w;
+          for (let xx = x0; xx <= x1; xx++) {
+            if (laplacian[row + xx] > lapLo) {
+              active = true;
+              break;
+            }
+          }
+        }
+      }
+      out[i] = active ? v : 0;
+    }
+  }
+  return out;
+}

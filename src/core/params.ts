@@ -46,6 +46,9 @@ function baseDefaults(): ModeDefaults {
     gridScale: 'auto',
     optimize: false,
     bakedBackground: 'auto',
+    regionDetail: 1,
+    maxStops: 8,
+    radialGradients: true,
     vtracer: { ...VTRACER_DEFAULTS },
   };
 }
@@ -53,6 +56,8 @@ function baseDefaults(): ModeDefaults {
 export const DEFAULTS: Record<ConcreteMode, ModeDefaults> = {
   lines: baseDefaults(),
   flat: baseDefaults(),
+  /** Every shape is its own path with its own gradient: cutout layers by default. */
+  gradient: { ...baseDefaults(), layering: 'cutout' },
   pixel: { ...baseDefaults(), upscale: 1, blurK: 0 },
 };
 
@@ -76,7 +81,8 @@ function pick<T>(v: T | undefined, def: T): T {
 
 /**
  * mode 'auto' without modeIfAuto -> 'lines'. Clamps: alphamax [0,1.334], opttolerance [0.01,1],
- * turdsize [0,100], blurK [0,1], thresholdOffset [-0.25,0.25], colors [2,32] (integer).
+ * turdsize [0,100], blurK [0,1], thresholdOffset [-0.25,0.25], colors [2,32] (integer),
+ * regionDetail [0.5,2], maxStops [2,8] (integer); radialGradients is true only when true.
  * pixel: upscale 1, sigmaPx 0. Non-finite numbers fall back to the mode default.
  */
 export function resolveParams(
@@ -93,6 +99,8 @@ export function resolveParams(
   const opttolerance = clampNum(params.opttolerance, d.opttolerance, 0.01, 1);
   const turdsize = clampNum(params.turdsize, d.turdsize, 0, 100);
   const thresholdOffset = clampNum(params.thresholdOffset, d.thresholdOffset, -0.25, 0.25);
+  const regionDetail = clampNum(params.regionDetail, d.regionDetail, 0.5, 2);
+  const maxStops = Math.round(clampNum(params.maxStops, d.maxStops, 2, 8));
 
   let colors: number | 'auto';
   const c = pick(params.colors, d.colors);
@@ -149,6 +157,9 @@ export function resolveParams(
     vtracer: vt,
     optimize: pick(params.optimize, d.optimize) === true,
     bakedBackground: pick(params.bakedBackground, d.bakedBackground) === 'keep' ? 'keep' : 'auto',
+    regionDetail,
+    maxStops,
+    radialGradients: pick(params.radialGradients, d.radialGradients) === true,
   };
 }
 

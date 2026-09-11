@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { BinaryMask, RasterImage, RGB } from '../../src/types';
+import type { BinaryMask, Fill, LinearGradient, RasterImage, RegionMap, RGB } from '../../src/types';
 import {
   aaCircle,
   aaDiagonalLine,
@@ -14,7 +14,13 @@ import {
   transparentLogo,
   bakedCheckerLogo,
   chessboardGraphic,
+  diagonalSweep,
+  gradientFeathers,
+  hueRamp,
+  radialDisc,
+  withNoise,
 } from '../../src/dev/synth';
+import { evaluateFill } from '../../src/core/fillEval';
 import { assertMaskNested, maskIoU, rasterEquals } from './helpers';
 
 // ---------------------------------------------------------------------------------------------
@@ -956,5 +962,346 @@ describe('chessboardGraphic', () => {
     expect(d[(16 * 96 + 16) * 4]).toBe(255);
     expect(d[(16 * 96 + 24) * 4]).toBe(204);
     expect(d[(24 * 96 + 24) * 4]).toBe(255);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Gradient fixtures
+// ---------------------------------------------------------------------------------------------
+
+const WHITE_RGB: RGB = [255, 255, 255];
+
+/** Largest channel gap between a pixel and round(fill at the pixel centre). */
+function fillGap(img: RasterImage, fill: Fill, x: number, y: number): number {
+  const c = evaluateFill(fill, x + 0.5, y + 0.5, [0, 0, 0]);
+  const o = (y * img.width + x) * 4;
+  return Math.max(
+    Math.abs(img.data[o] - Math.round(c[0])),
+    Math.abs(img.data[o + 1] - Math.round(c[1])),
+    Math.abs(img.data[o + 2] - Math.round(c[2])),
+  );
+}
+
+function labelMask(labels: RegionMap, id: number): BinaryMask {
+  const data = new Uint8Array(labels.data.length);
+  for (let i = 0; i < data.length; i++) data[i] = labels.data[i] === id ? 1 : 0;
+  return { data, width: labels.width, height: labels.height };
+}
+
+const hex = (c: RGB): string => '#' + c.map((v) => v.toString(16).padStart(2, '0')).join('');
+
+/** Pairs "a-b" (a < b, both non-background) of labels that are 4-adjacent somewhere. */
+function touchingPairs(labels: RegionMap): string[] {
+  const { width: w, height: h, data } = labels;
+  const pairs = new Set<string>();
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const a = data[y * w + x];
+      const right = x + 1 < w ? data[y * w + x + 1] : a;
+      const below = y + 1 < h ? data[(y + 1) * w + x] : a;
+      for (const b of [right, below]) {
+        if (a !== b && a !== 0 && b !== 0) pairs.add(`${Math.min(a, b)}-${Math.max(a, b)}`);
+      }
+    }
+  }
+  return [...pairs].sort();
+}
+
+/**
+ * Pixels at least 1 px inside their topmost shape and 1 px away from every later one (or 1 px away from
+ * every shape for the background): no anti-aliasing reaches them. Calls visit(x, y, topIndex | -1).
+ */
+function forEachInterior(size: number, sdfs: ReadonlyArray<(x: number, y: number) => number>, visit: (x: number, y: number, top: number) => void): void {
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      const d = sdfs.map((f) => f(x + 0.5, y + 0.5));
+      let top = -1;
+      for (let k = 0; k < d.length; k++) if (d[k] < 0) top = k;
+      if (top >= 0 && d[top] > -1) continue;
+      if (d.some((v, k) => k > top && v < 1)) continue;
+      visit(x, y, top);
+    }
+  }
+}
+
+describe('gradientFeathers', () => {
+  const fx = gradientFeathers();
+  const { image, shapes, labels } = fx;
+
+  it('is deterministic; the seed only changes the tip lengths', () => {
+    const again = gradientFeathers();
+    expect(rasterEquals(again.image, image)).toBe(true);
+    expect(again.labels.data).toEqual(labels.data);
+    const other = gradientFeathers(256, 2);
+    expect(rasterEquals(other.image, image)).toBe(false);
+    for (let k = 0; k < 8; k++) {
+      const a = shapes[k].fill as LinearGradient;
+      const b = other.shapes[k].fill as LinearGradient;
+      expect([b.x1, b.y1, b.stops]).toEqual([a.x1, a.y1, a.stops]);
+      const length = Math.hypot(b.x2 - b.x1, b.y2 - b.y1);
+      expect(length).toBeGreaterThanOrEqual(104 * 0.94 - 1e-9);
+      expect(length).toBeLessThanOrEqual(104 + 1e-9);
+    }
+  });
+
+  it('white background, 8 two-stop linear feathers along their axes with distinct colours, a flat shadow last', () => {
+    expect(fx.background).toEqual(WHITE_RGB);
+    expect(shapes.map((sh) => sh.label)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    expect([image.width, labels.width, labels.height, labels.count]).toEqual([256, 256, 256, 10]);
+    const pairs = new Set<string>();
+    for (let k = 0; k < 8; k++) {
+      const f = shapes[k].fill;
+      if (f.kind !== 'linear') throw new Error(`feather ${k + 1} is not linear`);
+      expect(f.stops.map((st) => st.offset)).toEqual([0, 1]);
+      pairs.add(f.stops.map((st) => hex(st.color)).join('>'));
+      expect((Math.atan2(-(f.y2 - f.y1), f.x2 - f.x1) * 180) / Math.PI).toBeCloseTo(7 + 22.5 * k, 9);
+      // The ramp runs from the middle of the base edge to the middle of the tip edge.
+      expect(Math.abs(shapes[k].sdf(f.x1, f.y1))).toBeLessThan(1e-9);
+      expect(Math.abs(shapes[k].sdf(f.x2, f.y2))).toBeLessThan(1e-9);
+      expect(shapes[k].sdf((f.x1 + f.x2) / 2, (f.y1 + f.y2) / 2)).toBeLessThan(-3);
+    }
+    expect(pairs.size).toBe(8);
+    expect((shapes[2].fill as LinearGradient).stops.map((st) => hex(st.color))).toEqual(['#2040d0', '#8030c0']);
+    expect((shapes[3].fill as LinearGradient).stops.map((st) => hex(st.color))).toEqual(['#8030c0', '#2040d0']);
+    expect(shapes[8].fill).toEqual({ kind: 'solid', color: [0x20, 0x22, 0x2a] });
+  });
+
+  it('ground truth: every interior pixel is round(fill at its centre) within 1 level and carries its label', () => {
+    let interior = 0;
+    let worst = 0;
+    let wrongLabel = 0;
+    const bg: Fill = { kind: 'solid', color: fx.background };
+    forEachInterior(256, shapes.map((sh) => sh.sdf), (x, y, top) => {
+      interior++;
+      worst = Math.max(worst, fillGap(image, top < 0 ? bg : shapes[top].fill, x, y));
+      if (labels.data[y * 256 + x] !== top + 1) wrongLabel++;
+    });
+    expect(interior).toBeGreaterThan(0.9 * 256 * 256);
+    expect(worst).toBeLessThanOrEqual(1);
+    expect(wrongLabel).toBe(0);
+  });
+
+  it('labels cover every pixel; each shape is one 4-connected piece; only 3-4 and the shadow with 6 and 7 touch', () => {
+    for (const seed of [1, 2, 3]) {
+      const f = seed === 1 ? fx : gradientFeathers(256, seed);
+      const seen = new Set<number>(f.labels.data);
+      expect([...seen].sort((a, b) => a - b), `seed ${seed}`).toEqual([0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+      for (let id = 0; id < 10; id++) {
+        expect(countComponents(labelMask(f.labels, id), 1, false), `seed ${seed} label ${id}`).toBe(1);
+      }
+      expect(touchingPairs(f.labels), `seed ${seed}`).toEqual(['3-4', '6-9', '7-9']);
+    }
+  });
+
+  it('feathers 3 and 4 are 4-adjacent along their shared side, where their ramps differ by >= 33 levels', () => {
+    const f3 = shapes[2].fill;
+    const f4 = shapes[3].fill;
+    const c3: RGB = [0, 0, 0];
+    const c4: RGB = [0, 0, 0];
+    let contacts = 0;
+    let minGap = Infinity;
+    for (let y = 0; y < 256; y++) {
+      for (let x = 0; x < 256; x++) {
+        if (labels.data[y * 256 + x] !== 3) continue;
+        for (const [nx, ny] of [
+          [x + 1, y],
+          [x - 1, y],
+          [x, y + 1],
+          [x, y - 1],
+        ]) {
+          if (labels.data[ny * 256 + nx] !== 4) continue;
+          contacts++;
+          evaluateFill(f3, x + 0.5, y + 0.5, c3);
+          evaluateFill(f4, nx + 0.5, ny + 0.5, c4);
+          minGap = Math.min(minGap, Math.max(Math.abs(c3[0] - c4[0]), Math.abs(c3[1] - c4[1]), Math.abs(c3[2] - c4[2])));
+        }
+      }
+    }
+    // Measured on seeds 1..8: 44 contacts, smallest gap 33.5..36.1 levels (seed 1: 35.7).
+    expect(contacts).toBeGreaterThanOrEqual(40);
+    expect(minGap).toBeGreaterThanOrEqual(33);
+  });
+
+  it('the shadow covers part of feathers 6 and 7 and nothing reaches within 3 px of the border', () => {
+    let over6 = 0;
+    let over7 = 0;
+    let nearBorder = 0;
+    for (let y = 0; y < 256; y++) {
+      for (let x = 0; x < 256; x++) {
+        const cx = x + 0.5;
+        const cy = y + 0.5;
+        if (shapes[8].sdf(cx, cy) < 0) {
+          if (shapes[5].sdf(cx, cy) < 0) over6++;
+          if (shapes[6].sdf(cx, cy) < 0) over7++;
+        }
+        if ((x < 3 || y < 3 || x > 252 || y > 252) && labels.data[y * 256 + x] !== 0) nearBorder++;
+      }
+    }
+    expect(over6).toBeGreaterThan(20);
+    expect(over7).toBeGreaterThan(20);
+    expect(nearBorder).toBe(0);
+  });
+
+  it('scales with size', () => {
+    const small = gradientFeathers(128);
+    expect([small.image.width, small.labels.count]).toEqual([128, 10]);
+    for (let id = 0; id < 10; id++) expect(countComponents(labelMask(small.labels, id), 1, false), `label ${id}`).toBe(1);
+    const a = shapes[0].fill as LinearGradient;
+    const b = small.shapes[0].fill as LinearGradient;
+    expect([b.x1, b.y1, b.x2, b.y2].map((v) => v * 2)).toEqual([a.x1, a.y1, a.x2, a.y2].map((v) => expect.closeTo(v, 9)));
+  });
+});
+
+describe('radialDisc', () => {
+  const fx = radialDisc();
+
+  it('a 3-stop radial gradient centred on the disc with r = its radius; deterministic', () => {
+    expect(fx.fill).toEqual({
+      kind: 'radial',
+      cx: 60,
+      cy: 66,
+      r: 48,
+      stops: [
+        { offset: 0, color: [0xff, 0xe0, 0x8a] },
+        { offset: 0.5, color: [0xff, 0x7a, 0x3d] },
+        { offset: 1, color: [0x7a, 0x1f, 0xa2] },
+      ],
+    });
+    expect(fx.sdf(60, 66)).toBe(-48);
+    expect(fx.sdf(108, 66)).toBeCloseTo(0, 12);
+    expect(rasterEquals(radialDisc().image, fx.image)).toBe(true);
+  });
+
+  it('interior pixels are the fill at their centre (±1 level); pixels 1 px outside are white', () => {
+    let inside = 0;
+    let worst = 0;
+    let notWhite = 0;
+    for (let y = 0; y < 128; y++) {
+      for (let x = 0; x < 128; x++) {
+        const d = fx.sdf(x + 0.5, y + 0.5);
+        if (d < -1) {
+          inside++;
+          worst = Math.max(worst, fillGap(fx.image, fx.fill, x, y));
+        } else if (d > 1 && px(fx.image, x, y).some((v) => v !== 255)) notWhite++;
+      }
+    }
+    expect(inside).toBeGreaterThan(0.95 * Math.PI * 47 * 47);
+    expect(worst).toBeLessThanOrEqual(1);
+    expect(notWhite).toBe(0);
+  });
+
+  it('scales with size', () => {
+    const big = radialDisc(256);
+    expect([big.image.width, big.fill.cx, big.fill.cy, big.fill.r]).toEqual([256, 120, 132, 96]);
+  });
+});
+
+describe('diagonalSweep', () => {
+  const fx = diagonalSweep();
+
+  it('a rounded square with a 4-stop gradient from the bottom-left to the top-right', () => {
+    expect(fx.fill.stops.map((st) => st.offset)).toEqual([0, 0.3, 0.65, 1]);
+    expect(fx.fill.stops.map((st) => hex(st.color))).toEqual(['#feda75', '#fa7e1e', '#d62976', '#962fbf']);
+    expect([fx.fill.x1, fx.fill.y1, fx.fill.x2, fx.fill.y2]).toEqual([20, 108, 108, 20]);
+    expect(fx.sdf(64, 64)).toBe(-48);
+    expect(fx.sdf(16.5, 16.5)).toBeGreaterThan(0); // rounded corner
+    expect(fx.sdf(16.5, 64)).toBeLessThan(0);
+    expect(rasterEquals(diagonalSweep().image, fx.image)).toBe(true);
+  });
+
+  it('interior pixels are the fill at their centre (±1 level); pixels 1 px outside are white', () => {
+    let inside = 0;
+    let worst = 0;
+    let notWhite = 0;
+    for (let y = 0; y < 128; y++) {
+      for (let x = 0; x < 128; x++) {
+        const d = fx.sdf(x + 0.5, y + 0.5);
+        if (d < -1) {
+          inside++;
+          worst = Math.max(worst, fillGap(fx.image, fx.fill, x, y));
+        } else if (d > 1 && px(fx.image, x, y).some((v) => v !== 255)) notWhite++;
+      }
+    }
+    expect(inside).toBeGreaterThan(0.9 * (96 * 96 - (4 - Math.PI) * 20 * 20));
+    expect(worst).toBeLessThanOrEqual(1);
+    expect(notWhite).toBe(0);
+  });
+});
+
+describe('hueRamp', () => {
+  const fx = hueRamp();
+
+  it('every pixel is the red → green ramp at its centre, identical rows', () => {
+    expect(fx.fill).toEqual({
+      kind: 'linear',
+      x1: 0,
+      y1: 48,
+      x2: 96,
+      y2: 48,
+      stops: [
+        { offset: 0, color: [0xed, 0x2b, 0x2b] },
+        { offset: 1, color: [0x14, 0x9e, 0x14] },
+      ],
+    });
+    let worst = 0;
+    for (let y = 0; y < 96; y++) for (let x = 0; x < 96; x++) worst = Math.max(worst, fillGap(fx.image, fx.fill, x, y));
+    expect(worst).toBe(0);
+    for (let x = 1; x < 96; x++) {
+      expect(px(fx.image, x, 0)[0]).toBeLessThanOrEqual(px(fx.image, x - 1, 0)[0]);
+      expect(px(fx.image, x, 0)[1]).toBeGreaterThanOrEqual(px(fx.image, x - 1, 0)[1]);
+      expect(px(fx.image, x, 77)).toEqual(px(fx.image, x, 0));
+    }
+  });
+
+  it('keeps a constant Rec.601 luma of 101.006 up to rounding (±0.5)', () => {
+    let worst = 0;
+    for (let o = 0; o < fx.image.data.length; o += 4) {
+      const d = fx.image.data;
+      worst = Math.max(worst, Math.abs(0.299 * d[o] + 0.587 * d[o + 1] + 0.114 * d[o + 2] - 101.006));
+    }
+    expect(worst).toBeLessThanOrEqual(0.5 + 1e-9);
+  });
+});
+
+describe('withNoise', () => {
+  function grey(): RasterImage {
+    const data = new Uint8ClampedArray(64 * 64 * 4).fill(128);
+    for (let o = 3; o < data.length; o += 4) data[o] = (o >> 2) % 256;
+    return { data, width: 64, height: 64 };
+  }
+
+  it('adds seeded uniform integer noise in [-amp, amp] to each channel and leaves alpha untouched', () => {
+    const img = grey();
+    const noisy = withNoise(img);
+    expect(rasterEquals(withNoise(grey()), noisy)).toBe(true);
+    expect(rasterEquals(withNoise(grey(), 3, 2), noisy)).toBe(false);
+    const counts = new Map<number, number>();
+    let sum = 0;
+    let sq = 0;
+    let n = 0;
+    for (let o = 0; o < noisy.data.length; o += 4) {
+      expect(noisy.data[o + 3]).toBe(img.data[o + 3]);
+      for (let ch = 0; ch < 3; ch++) {
+        const delta = noisy.data[o + ch] - 128;
+        counts.set(delta, (counts.get(delta) ?? 0) + 1);
+        sum += delta;
+        sq += delta * delta;
+        n++;
+      }
+    }
+    expect([...counts.keys()].sort((a, b) => a - b)).toEqual([-3, -2, -1, 0, 1, 2, 3]);
+    expect(Math.abs(sum / n)).toBeLessThan(0.1);
+    expect(Math.sqrt(sq / n - (sum / n) ** 2)).toBeCloseTo(2, 1); // sqrt(3·4/3)
+    expect(img.data.every((v, i) => i % 4 === 3 || v === 128)).toBe(true);
+  });
+
+  it('clamps at 255 and amp 0 is an exact copy', () => {
+    const white: RasterImage = { data: new Uint8ClampedArray(16 * 16 * 4).fill(255), width: 16, height: 16 };
+    const noisy = withNoise(white, 3, 5);
+    expect(noisy.data.every((v) => v >= 252 && v <= 255)).toBe(true);
+    const img = grey();
+    const copy = withNoise(img, 0);
+    expect(rasterEquals(copy, img)).toBe(true);
+    expect(copy.data).not.toBe(img.data);
   });
 });

@@ -129,6 +129,13 @@ describe('dev fixtures', () => {
     expect(transparent).toBeGreaterThan(1000);
     expect(opaque).toBeGreaterThan(500);
   });
+
+  it('builds the gradient fixtures at preview size', () => {
+    expect(parseSynthParam('?synth=gradient')).toBe('gradient');
+    expect(parseSynthParam('?synth=radial')).toBe('radial');
+    expect(buildSynthFixture('gradient').image.width).toBe(512);
+    expect(buildSynthFixture('radial').image.width).toBe(256);
+  });
 });
 
 describe('tune summary', () => {

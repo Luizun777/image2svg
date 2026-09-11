@@ -36,7 +36,6 @@
  * trace is returned at once with score = its fidelity.
  */
 import type {
-  AbsPath,
   BackgroundSetting,
   BakedCheckerboard,
   BinaryMask,
@@ -60,7 +59,20 @@ import { classify } from '../core/classify';
 import { detectGrid } from '../core/edges';
 import { countInk } from '../core/morphology';
 import { VTRACER_DEFAULTS, resolveParams } from '../core/params';
-import { bakedCheckerboardWarning, prepareFlat, prepareLines, trace, traceInput, type Prepared } from '../core/pipeline';
+import { scaleGradient } from '../core/fillEval';
+import {
+  bakedCheckerboardWarning,
+  fitGradientRegions,
+  isFullMask,
+  layerMask,
+  prepareForMode,
+  prepareGradient,
+  trace,
+  traceInput,
+  traceLayers,
+  type GradientFit,
+  type Prepared,
+} from '../core/pipeline';
 import { downscaleNearest } from '../core/pixelExact';
 import { downscaleBoxRaster } from '../core/upscale';
 import { computeMetrics, tunerScore } from '../metrics/fidelity';
@@ -145,10 +157,10 @@ export function metricBackground(info: Pick<SourceInfo, 'borderColor'>): RGB {
 
 /**
  * Colour a trace of `image` and `image` itself are composited on for metrics. `image` is the traced
- * source (traceInput(img, info, params).image) and `info` its analysis. In flat mode an opaque
- * background resolved from `background` is painted by the SVG over the whole canvas, so the source's
- * transparent pixels are shown on it too; otherwise (lines, pixel, or a transparent flat background)
- * metricBackground(info).
+ * source (traceInput(img, info, params).image) and `info` its analysis. In flat and gradient modes an
+ * opaque background resolved from `background` is painted by the SVG over the whole canvas, so the
+ * source's transparent pixels are shown on it too; otherwise (lines, pixel, or a transparent flat or
+ * gradient background) metricBackground(info).
  */
 export function comparisonBackground(
   image: RasterImage,
@@ -156,7 +168,7 @@ export function comparisonBackground(
   mode: ConcreteMode,
   background: BackgroundSetting = 'auto',
 ): RGB {
-  const painted = mode === 'flat' ? resolveBackground(image, background, info) : null;
+  const painted = mode === 'flat' || mode === 'gradient' ? resolveBackground(image, background, info) : null;
   return painted ?? metricBackground(info);
 }
 
@@ -200,7 +212,10 @@ export function renderLayersAt1x(layers: Layer[], U: number, width: number, heig
       }
     }
     // One path per layer: the rasteriser applies nonzero winding to the union of all edges anyway.
-    return { ...layer, paths: [{ segs }] };
+    // A gradient is in viewBox units like the paths: scaled by 1/U too.
+    const out: Layer = { ...layer, paths: [{ segs }] };
+    if (layer.gradient !== undefined) out.gradient = scaleGradient(layer.gradient, s);
+    return out;
   });
   return rasterizeLayers(scaled, width, height, background, Math.min(64, 4 * Math.max(1, Math.round(U))));
 }
@@ -208,6 +223,7 @@ export function renderLayersAt1x(layers: Layer[], U: number, width: number, heig
 // ---------------------------------------------------------------------------------------------
 // Mirror of the private steps of core/pipeline.trace(), so that a candidate's output is exactly
 // what trace() gives for its params (tests/tuner/autotune.test.ts checks svg/stats/warnings).
+// The preparation dispatch (prepareForMode) and traceLayers are shared with the pipeline.
 // ---------------------------------------------------------------------------------------------
 
 function mergeParams(base: TraceParams, over: TraceParams): TraceParams {
@@ -259,39 +275,6 @@ function tracerOptions(resolved: ResolvedParams): TracerOptions {
   };
 }
 
-function isFullMask(mask: BinaryMask): boolean {
-  const d = mask.data;
-  for (let i = 0; i < d.length; i++) if (d[i] === 0) return false;
-  return d.length > 0;
-}
-
-function rectPath(w: number, h: number): AbsPath {
-  return {
-    segs: [
-      { kind: 'M', x: 0, y: 0 },
-      { kind: 'L', x: w, y: 0 },
-      { kind: 'L', x: w, y: h },
-      { kind: 'L', x: 0, y: h },
-      { kind: 'Z' },
-    ],
-  };
-}
-
-async function traceLayers(prepared: Prepared, tracer: Tracer, opts: TracerOptions): Promise<Layer[]> {
-  const vw = prepared.width * prepared.U;
-  const vh = prepared.height * prepared.U;
-  const layers: Layer[] = [];
-  for (let i = 0; i < prepared.layers.length; i++) {
-    const pl = prepared.layers[i];
-    const paths: AbsPath[] = isFullMask(pl.mask) ? [rectPath(vw, vh)] : await tracer.traceBinary(pl.mask, opts);
-    if (paths.length === 0) continue;
-    const layer: Layer = { fill: pl.fill, paths };
-    if (pl.opacity !== undefined && pl.opacity < 1) layer.opacity = pl.opacity;
-    layers.push(layer);
-  }
-  return layers;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Search
 // ---------------------------------------------------------------------------------------------
@@ -307,6 +290,11 @@ interface Context {
   /** Fake checkerboard trace() makes transparent for these params (its warning goes first), or null. */
   baked: BakedCheckerboard | null;
   bg: RGB;
+  /**
+   * Gradient mode: the segmentation and models of each traced image (the source or its proxy), which do not depend
+   * on the upscale, the blur or the tracer; keyed by what they do depend on (gradientFitKey).
+   */
+  gradientFits: WeakMap<RasterImage, { key: string; fit: GradientFit }>;
 }
 
 interface Scored extends Standing {
@@ -377,8 +365,21 @@ function plan(ctx: Context, scale: Scale, params: TraceParams): Planned {
   return { params, resolved, tracer: picked.tracer, engineWarning: picked.warning, key: evalKey(resolved) };
 }
 
+/** What fitGradientRegions reads from the resolved params (with the image and ctx.info, fixed per run). */
+function gradientFitKey(r: ResolvedParams): string {
+  return `${JSON.stringify(r.background)}|${r.regionDetail}|${r.maxStops}|${r.radialGradients ? 1 : 0}`;
+}
+
+/** prepareForMode, with the gradient-mode segmentation and models memoised per image (the layers are identical). */
 function prepare(ctx: Context, img: RasterImage, resolved: ResolvedParams): Prepared {
-  return resolved.mode === 'lines' ? prepareLines(img, resolved, ctx.info) : prepareFlat(img, resolved, ctx.info);
+  if (resolved.mode !== 'gradient') return prepareForMode(img, resolved, ctx.info);
+  const key = gradientFitKey(resolved);
+  let memo = ctx.gradientFits.get(img);
+  if (memo === undefined || memo.key !== key) {
+    memo = { key, fit: fitGradientRegions(img, resolved, ctx.info) };
+    ctx.gradientFits.set(img, memo);
+  }
+  return prepareGradient(img, resolved, ctx.info, memo.fit);
 }
 
 function prepareCached(ctx: Context, scale: Scale, resolved: ResolvedParams): Prepared {
@@ -394,7 +395,10 @@ function makeScale(ctx: Context, img: RasterImage, full: boolean, base: TracePar
   const resolved = resolveFor(ctx, img, { ...base, upscale: 1, blurK: 0 });
   const prepared = prepare(ctx, img, resolved);
   let perimeter = 0;
-  for (const layer of prepared.layers) if (!isFullMask(layer.mask)) perimeter += maskPerimeter(layer.mask);
+  for (const layer of prepared.layers) {
+    const mask = layerMask(layer);
+    if (!isFullMask(mask)) perimeter += maskPerimeter(mask);
+  }
   return { img, full, perimeter, scores: new Map(), prep: null, lastMs: 0 };
 }
 
@@ -451,7 +455,7 @@ async function evaluate(ctx: Context, scale: Scale, planned: Planned): Promise<E
     width: prepared.width,
     height: prepared.height,
     preparedWarnings: prepared.warnings,
-    inkDropped: layers.length === 0 && prepared.layers.some((l) => countInk(l.mask) > 0),
+    inkDropped: layers.length === 0 && prepared.layers.some((l) => countInk(layerMask(l)) > 0),
   };
 }
 
@@ -592,6 +596,7 @@ export async function autotune(
     clsWarnings: cls === null ? [] : cls.warnings,
     baked: input.info.bakedBackground ?? null,
     bg: comparisonBackground(source, input.info, base.mode, base.background),
+    gradientFits: new WeakMap(),
   };
   if (base.mode === 'pixel') return tunePixel(ctx, img, source, params, opts, t0);
 

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  MODE_LABEL,
   NBSP,
   fidelityExplanation,
   fidelityLevel,
@@ -91,6 +92,8 @@ describe('fidelityLevel', () => {
     expect(lines).toContain('SSIM');
     expect(lines).toContain('formas (IoU)');
     expect(fidelityExplanation('flat')).toContain('color píxel a píxel');
+    expect(fidelityExplanation('gradient')).toBe(fidelityExplanation('flat'));
+    expect(MODE_LABEL.gradient).toBe('Degradados');
     expect(lines).not.toMatch(/\n|—/);
   });
 });

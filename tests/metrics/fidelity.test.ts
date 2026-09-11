@@ -220,3 +220,15 @@ describe('tunerScore', () => {
     expect(tunerScore(m, stats(50, 0.1), 200)).toBeGreaterThan(tunerScore(m, stats(300, 0.1), 200));
   });
 });
+
+describe('computeMetrics: gradient mode', () => {
+  it('is measured like flat: colour agreement, not shapes', () => {
+    const original = flatShapes3().image;
+    const rendered = cloneRaster(original);
+    for (let o = 0; o < rendered.data.length; o += 28) rendered.data[o] = 255 - rendered.data[o];
+    const bg: [number, number, number] = [0xf2, 0xe8, 0xd5];
+    const flat = computeMetrics({ original, rendered, mode: 'flat', background: bg });
+    expect(flat.iou).toBeLessThan(1);
+    expect(computeMetrics({ original, rendered, mode: 'gradient', background: bg })).toEqual(flat);
+  });
+});

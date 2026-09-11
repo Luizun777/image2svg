@@ -40,7 +40,7 @@ import {
   tuneResultOutdated,
   type ShownTuneResult,
 } from './tuneProgress';
-import { mergeWarnings, warningAction, withBakedCheckerboard } from './warnings';
+import { isGradientCandidate, mergeWarnings, warningAction, withBakedCheckerboard } from './warnings';
 import { createWarnings } from './warningsView';
 
 export interface MountOptions {
@@ -185,7 +185,13 @@ export function mountApp(root: HTMLElement, client: TraceClient, opts: MountOpti
       ui.bakedBackground ?? 'auto',
       effectiveMode(ui, loaded.classification.mode),
     );
-    const ctx = { params: ui, mode, engines, resolvedUpscale: current?.resolved.upscale ?? null };
+    const ctx = {
+      params: ui,
+      mode,
+      engines,
+      resolvedUpscale: current?.resolved.upscale ?? null,
+      gradientCandidate: isGradientCandidate(loaded.info),
+    };
     warningsView.set(list.map((warning) => ({ warning, action: warningAction(warning, ctx) })));
   }
 

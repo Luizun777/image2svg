@@ -1,7 +1,9 @@
 import { describe, expect, it } from 'vitest';
 import { assembleSvg } from '../../src/svg/assemble';
-import type { AbsPath, Layer } from '../../src/types';
-import { optimizeSvg, svgDataUrl, svgFileName } from '../../src/ui/output';
+import { gradientMeanHex } from '../../src/svg/gradients';
+import type { AbsPath, Layer, LinearGradient, RadialGradient } from '../../src/types';
+import { SVGO_CONFIG, optimizeSvg, svgDataUrl, svgFileName } from '../../src/ui/output';
+import { parseSvg } from '../fixtures/svgBack';
 
 const PREFIX = 'data:image/svg+xml;charset=utf-8,';
 
@@ -79,5 +81,73 @@ describe('optimizeSvg', () => {
     expect(out.match(/<path\b/g)?.length).toBe(3);
     expect(out).not.toMatch(/\d\.\d{5,}/);
     expect(out).toContain('16.1235');
+  });
+
+  it('keeps the gradient <defs>: ids g<h>-0 and g<h>-1, userSpaceOnUse, the same stops and matching url(#…) references', async () => {
+    const linear: LinearGradient = {
+      kind: 'linear',
+      x1: 16.123456,
+      y1: 20,
+      x2: 48,
+      y2: 40.5,
+      stops: [
+        { offset: 0, color: [254, 218, 117] },
+        { offset: 0.35, color: [214, 41, 118] },
+        { offset: 1, color: [150, 47, 191] },
+      ],
+    };
+    // #ffffff comes back as #fff (convertColors): parseSvg reads both forms
+    const radial: RadialGradient = {
+      kind: 'radial',
+      cx: 32,
+      cy: 30,
+      r: 12.5,
+      stops: [
+        { offset: 0, color: [26, 43, 60] },
+        { offset: 1, color: [255, 255, 255] },
+      ],
+    };
+    const gradientLayers: Layer[] = [
+      { fill: gradientMeanHex(linear), gradient: linear, paths: [square] },
+      { fill: '#2a6f97', paths: [triangle] },
+      { fill: gradientMeanHex(radial), gradient: radial, paths: [triangle] },
+    ];
+    const svg = assembleSvg(gradientLayers, { width: 16, height: 16, viewBoxWidth: 64, viewBoxHeight: 64, precision: 6 });
+    const out = await optimizeSvg(svg);
+    const pre = /id="(g[0-9a-z]+)-0"/.exec(svg)?.[1] ?? '';
+    expect(pre).toMatch(/^g[0-9a-z]+$/);
+    expect(out).toMatch(/<defs>/);
+    expect(out).toMatch(new RegExp(`<linearGradient\\b[^>]*\\sid="${pre}-0"`));
+    expect(out).toMatch(new RegExp(`<radialGradient\\b[^>]*\\sid="${pre}-1"`));
+    expect(out.match(/gradientUnits="userSpaceOnUse"/g)?.length).toBe(2);
+    expect(out).not.toMatch(/gradientTransform|\sfx=|\sfy=/);
+    expect(out.split(`fill="url(#${pre}-0)"`).length - 1).toBe(1);
+    expect(out.split(`fill="url(#${pre}-1)"`).length - 1).toBe(1);
+    expect(out.match(/<path\b/g)?.length).toBe(3);
+
+    const before = parseSvg(svg).layers;
+    const after = parseSvg(out).layers;
+    expect(after.map((l) => l.gradient?.kind ?? l.fill)).toEqual(['linear', '#2a6f97', 'radial']);
+    for (const i of [0, 2]) {
+      const a = after[i].gradient;
+      const b = before[i].gradient;
+      expect(a?.stops).toEqual(b?.stops);
+      expect(after[i].fill).toBe(before[i].fill);
+      if (a?.kind === 'linear' && b?.kind === 'linear') {
+        for (const k of ['x1', 'y1', 'x2', 'y2'] as const) expect(Math.abs(a[k] - b[k])).toBeLessThanOrEqual(1e-4);
+      } else if (a?.kind === 'radial' && b?.kind === 'radial') {
+        for (const k of ['cx', 'cy', 'r'] as const) expect(Math.abs(a[k] - b[k])).toBeLessThanOrEqual(1e-4);
+      } else {
+        expect.unreachable(`layer ${i}: ${a?.kind} vs ${b?.kind}`);
+      }
+    }
+  });
+
+  it('SVGO_CONFIG is the single configuration: preset-default with mergePaths and cleanupIds off, 4 decimals', () => {
+    expect(SVGO_CONFIG).toEqual({
+      multipass: false,
+      floatPrecision: 4,
+      plugins: [{ name: 'preset-default', params: { floatPrecision: 4, overrides: { mergePaths: false, cleanupIds: false } } }],
+    });
   });
 });

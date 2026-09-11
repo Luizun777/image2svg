@@ -6,7 +6,9 @@ import { transparentLogo } from '../../src/dev/synth';
 import type { BakedCheckerboard, RasterImage, Warning, WarningCode } from '../../src/types';
 import type { WarningContext } from '../../src/ui/warnings';
 import {
+  GRADIENT_CANDIDATE_MIN_EXPLAINED,
   WARNING_TITLE,
+  isGradientCandidate,
   keptCheckerboardMessage,
   mergeWarnings,
   suggestsAlphaMask,
@@ -23,6 +25,7 @@ function ctx(over: Partial<WarningContext> = {}): WarningContext {
     mode: 'flat',
     engines: { potrace: true, vtracer: true },
     resolvedUpscale: 2,
+    gradientCandidate: false,
     ...over,
   };
 }
@@ -36,6 +39,13 @@ describe('mergeWarnings', () => {
     );
     expect(merged.map((x) => x.code)).toEqual(['upscale-capped', 'photo']);
     expect(merged[0].message).toBe('a');
+  });
+
+  it("drops the classifier photo warning in gradient mode (it describes the 16-colour flat palette and suggests Degradados)", () => {
+    const photo = w('photo', 'La imagen tiene más de 32 colores reales; ... Se usará una paleta de 16 colores ... Prueba el modo Degradados.');
+    expect(mergeWarnings([], [photo], 'gradient')).toEqual([]);
+    expect(mergeWarnings([w('gradient-fallback', 'g')], [photo], 'gradient').map((x) => x.code)).toEqual(['gradient-fallback']);
+    for (const mode of ['flat', 'lines', 'pixel'] as const) expect(mergeWarnings([], [photo], mode)).toEqual([photo]);
   });
 
   it('drops the classifier thin-strokes warning outside line tracing', () => {
@@ -57,6 +67,40 @@ describe('warningAction', () => {
     const toFlat = warningAction(w('photo'), ctx({ mode: 'lines' }));
     expect(toFlat?.label).toBe('Cambiar a Color plano');
     expect(toFlat?.apply({ mode: 'auto' })).toEqual({ mode: 'flat' });
+    expect(warningAction(w('photo'), ctx({ mode: 'gradient' }))?.label).toBe('Cambiar a Color plano');
+  });
+
+  it('photo: "Usar degradados" for a gradient candidate outside gradient mode, today\'s offer otherwise', () => {
+    for (const mode of ['flat', 'lines', 'pixel'] as const) {
+      const a = warningAction(w('photo'), ctx({ mode, gradientCandidate: true }));
+      expect(a?.label, mode).toBe('Usar degradados');
+      expect(a?.apply({ mode: 'auto', colors: 16, exactPalette: false })).toEqual({
+        mode: 'gradient',
+        colors: 16,
+        exactPalette: false,
+      });
+    }
+    // 32 colours already chosen: gradients are still worth offering, more colours are not.
+    expect(warningAction(w('photo'), ctx({ params: { colors: 32 }, gradientCandidate: true }))?.label).toBe('Usar degradados');
+    // Already tracing with gradients: the candidate changes nothing.
+    const inGradient = warningAction(w('photo'), ctx({ mode: 'gradient', gradientCandidate: true }));
+    expect(inGradient?.label).toBe('Cambiar a Color plano');
+    expect(inGradient?.apply({ mode: 'gradient' })).toEqual({ mode: 'flat' });
+    // Not a candidate: exactly the previous actions.
+    expect(warningAction(w('photo'), ctx({ gradientCandidate: false }))?.label).toBe('Usar 32 colores');
+    expect(warningAction(w('photo'), ctx({ mode: 'lines', gradientCandidate: false }))?.label).toBe('Cambiar a Color plano');
+    expect(warningAction(w('photo'), ctx({ params: { colors: 32 }, gradientCandidate: false }))).toBeNull();
+  });
+
+  it('isGradientCandidate: the gradient probe must explain at least half of the image', () => {
+    expect(GRADIENT_CANDIDATE_MIN_EXPLAINED).toBe(0.5);
+    const withExplained = (explained: number): Parameters<typeof isGradientCandidate>[0] => ({
+      gradientProbe: { sigma: 0.1, regions: 12, explained, linearShare: 0.4, radialShare: 0, edgeShare: 0.05 },
+    });
+    expect(isGradientCandidate({ gradientProbe: null })).toBe(false);
+    expect(isGradientCandidate(withExplained(0.49))).toBe(false);
+    expect(isGradientCandidate(withExplained(0.5))).toBe(true);
+    expect(isGradientCandidate(withExplained(0.97))).toBe(true);
   });
 
   it('thin-strokes: upscale first, then less blur', () => {
@@ -80,6 +124,7 @@ describe('warningAction', () => {
       vtracer: { maxIterations: 12, filterSpeckle: 0 },
     });
     expect(warningAction(w('empty-trace'), ctx({ params: { turdsize: 0 } }))).toBeNull();
+    expect(warningAction(w('empty-trace'), ctx({ mode: 'gradient' }))?.apply({})).toEqual({ turdsize: 0 });
   });
 
   it('engine-unavailable offers the other engine only if it works', () => {
@@ -94,6 +139,13 @@ describe('warningAction', () => {
   it('has no action for purely informative warnings', () => {
     expect(warningAction(w('upscale-capped'), ctx())).toBeNull();
     expect(warningAction(w('large-input'), ctx())).toBeNull();
+  });
+
+  it('gradient-fallback: titled, and offers Color plano', () => {
+    expect(WARNING_TITLE['gradient-fallback']).toBe('Degradados no reconstruidos');
+    const a = warningAction(w('gradient-fallback'), ctx({ mode: 'gradient' }));
+    expect(a?.label).toBe('Cambiar a Color plano');
+    expect(a?.apply({ mode: 'gradient', maxStops: 4 })).toEqual({ mode: 'flat', maxStops: 4 });
   });
 });
 
@@ -112,12 +164,12 @@ const BOARD: BakedCheckerboard = {
 describe('painted checkerboard banner', () => {
   it('has a title and toggles between keeping the board and treating it as transparent, in every mode', () => {
     expect(WARNING_TITLE['baked-checkerboard']).toBe('Transparencia falsa');
-    for (const mode of ['flat', 'pixel'] as const) {
+    for (const mode of ['flat', 'gradient', 'pixel'] as const) {
       const keep = warningAction(w('baked-checkerboard'), ctx({ mode }));
       expect(keep?.label, mode).toBe('Mantener el tablero');
       expect(keep?.apply({ colors: 16 })).toEqual({ colors: 16, bakedBackground: 'keep' });
     }
-    for (const mode of ['lines', 'flat', 'pixel'] as const) {
+    for (const mode of ['lines', 'flat', 'gradient', 'pixel'] as const) {
       const back = warningAction(w('baked-checkerboard'), ctx({ mode, params: { bakedBackground: 'keep' } }));
       expect(back?.label, mode).toBe('Tratar como transparente');
       expect(back?.apply({ colors: 16, bakedBackground: 'keep' })).toEqual({ colors: 16, bakedBackground: 'auto' });

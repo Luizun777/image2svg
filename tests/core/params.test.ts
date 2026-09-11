@@ -19,7 +19,7 @@ describe('DEFAULTS', () => {
   });
 
   it('shared defaults per mode match the plan', () => {
-    for (const mode of ['lines', 'flat', 'pixel'] as ConcreteMode[]) {
+    for (const mode of ['lines', 'flat', 'gradient', 'pixel'] as ConcreteMode[]) {
       const d = DEFAULTS[mode];
       expect(d.engine).toBe('potrace');
       expect(d.alphamax).toBe(1.0);
@@ -29,7 +29,10 @@ describe('DEFAULTS', () => {
       expect(d.opticurve).toBe(true);
       expect(d.colors).toBe('auto');
       expect(d.exactPalette).toBe(true);
-      expect(d.layering).toBe('stacked');
+      expect(d.layering).toBe(mode === 'gradient' ? 'cutout' : 'stacked');
+      expect(d.regionDetail).toBe(1);
+      expect(d.maxStops).toBe(8);
+      expect(d.radialGradients).toBe(true);
       expect(d.background).toBe('auto');
       expect(d.alphaMode).toBe('auto');
       expect(d.fill).toBe('auto');
@@ -43,12 +46,15 @@ describe('DEFAULTS', () => {
     expect(DEFAULTS.lines.upscale).toBe('auto');
     expect(DEFAULTS.flat.blurK).toBe(0.35);
     expect(DEFAULTS.flat.upscale).toBe('auto');
+    expect(DEFAULTS.gradient.blurK).toBe(0.35);
+    expect(DEFAULTS.gradient.upscale).toBe('auto');
     expect(DEFAULTS.pixel.blurK).toBe(0);
     expect(DEFAULTS.pixel.upscale).toBe(1);
   });
 
   it('each mode owns its own vtracer object (no shared mutable state)', () => {
     expect(DEFAULTS.lines.vtracer).not.toBe(DEFAULTS.flat.vtracer);
+    expect(DEFAULTS.gradient.vtracer).not.toBe(DEFAULTS.flat.vtracer);
     expect(DEFAULTS.lines.vtracer).not.toBe(VTRACER_DEFAULTS);
   });
 });
@@ -205,10 +211,47 @@ describe('resolveParams', () => {
 
 describe('resolveParams: bakedBackground', () => {
   it("defaults to 'auto' in every mode and passes 'keep' through", () => {
-    for (const mode of ['lines', 'flat', 'pixel'] as ConcreteMode[]) expect(DEFAULTS[mode].bakedBackground).toBe('auto');
+    for (const mode of ['lines', 'flat', 'gradient', 'pixel'] as ConcreteMode[]) expect(DEFAULTS[mode].bakedBackground).toBe('auto');
     expect(resolveParams({}, SRC).bakedBackground).toBe('auto');
     expect(resolveParams({ bakedBackground: 'keep' }, SRC).bakedBackground).toBe('keep');
     expect(resolveParams({ mode: 'pixel', bakedBackground: 'keep' }, SRC).bakedBackground).toBe('keep');
     expect(resolveParams({ bakedBackground: 'bogus' as unknown as TraceParams['bakedBackground'] }, SRC).bakedBackground).toBe('auto');
+  });
+});
+
+describe('resolveParams: gradient mode', () => {
+  it('DEFAULTS.gradient = the shared defaults with cutout layers', () => {
+    expect(DEFAULTS.gradient).toEqual({ ...DEFAULTS.flat, layering: 'cutout' });
+  });
+
+  it('resolves the gradient knobs to their defaults in every mode', () => {
+    for (const mode of ['lines', 'flat', 'gradient', 'pixel'] as ConcreteMode[]) {
+      const r = resolveParams({ mode }, SRC);
+      expect([r.regionDetail, r.maxStops, r.radialGradients], mode).toEqual([1, 8, true]);
+    }
+    const g = resolveParams({ mode: 'gradient' }, SRC);
+    expect(g.mode).toBe('gradient');
+    expect(g.layering).toBe('cutout');
+    expect(g.upscale).toBe(4);
+    expect(g.sigmaPx).toBeCloseTo(1.4, 10);
+    expect(g.colors).toBe('auto');
+    expect(resolveParams({ mode: 'auto' }, SRC, 'gradient').layering).toBe('cutout');
+    expect(resolveParams({ mode: 'gradient', layering: 'stacked' }, SRC).layering).toBe('stacked');
+  });
+
+  it('clamps regionDetail to [0.5, 2] and maxStops to an integer in [2, 8]', () => {
+    expect(resolveParams({ regionDetail: 0.1, maxStops: 1 }, SRC)).toMatchObject({ regionDetail: 0.5, maxStops: 2 });
+    expect(resolveParams({ regionDetail: 5, maxStops: 20 }, SRC)).toMatchObject({ regionDetail: 2, maxStops: 8 });
+    expect(resolveParams({ regionDetail: 1.5, maxStops: 3.6 }, SRC)).toMatchObject({ regionDetail: 1.5, maxStops: 4 });
+    expect(resolveParams({ regionDetail: Number.NaN, maxStops: Number.POSITIVE_INFINITY }, SRC)).toMatchObject({
+      regionDetail: 1,
+      maxStops: 8,
+    });
+  });
+
+  it('radialGradients: false passes through; anything but a boolean true is false', () => {
+    expect(resolveParams({ radialGradients: false }, SRC).radialGradients).toBe(false);
+    expect(resolveParams({ mode: 'gradient', radialGradients: true }, SRC).radialGradients).toBe(true);
+    expect(resolveParams({ radialGradients: 'yes' as unknown as boolean }, SRC).radialGradients).toBe(false);
   });
 });

@@ -34,7 +34,7 @@ export interface LabelMap {
 
 export type RGB = [number, number, number];
 
-export type Mode = 'auto' | 'lines' | 'flat' | 'pixel';
+export type Mode = 'auto' | 'lines' | 'flat' | 'gradient' | 'pixel';
 export type ConcreteMode = Exclude<Mode, 'auto'>;
 export type Engine = 'potrace' | 'vtracer';
 export type Layering = 'stacked' | 'cutout';
@@ -105,6 +105,12 @@ export interface TraceParams {
   optimize?: boolean;
   /** Fake transparency (checkerboard painted into the pixels): 'auto' treats it as transparent. Default 'auto'. */
   bakedBackground?: BakedBackgroundSetting;
+  /** Gradient mode: segmentation detail 0.5..2; the edge thresholds are divided by it (above 1, more regions). Default 1. */
+  regionDetail?: number;
+  /** Gradient mode: most colour stops per gradient, integer 2..8. Default 8. */
+  maxStops?: number;
+  /** Gradient mode: allow radial gradients. Default true. */
+  radialGradients?: boolean;
 }
 
 /** Fully resolved, numeric parameters used by the pipeline. */
@@ -132,6 +138,9 @@ export interface ResolvedParams {
   vtracer: VtracerParams;
   optimize: boolean;
   bakedBackground: BakedBackgroundSetting;
+  regionDetail: number; // 0.5..2
+  maxStops: number; // integer 2..8
+  radialGradients: boolean;
 }
 
 /** Absolute path segments in some pixel space (y down). */
@@ -146,9 +155,125 @@ export interface AbsPath {
   segs: Seg[];
 }
 
+// ---------------------------------------------------------------------------------------------
+// Gradient mode ('gradient'): fills, regions and models
+//
+// Coordinate convention of every fill (core/fillEval.ts is the only implementation): continuous
+// image coordinates where pixel (x, y) covers [x, x+1) x [y, y+1) and is sampled at its centre
+// (x + 0.5, y + 0.5). Fills fitted at 1x are in 1x units; the Ux pixel (X, Y) has its centre at
+// ((X + 0.5)/U, (Y + 0.5)/U) in 1x units, so a 1x fill is emitted in viewBox units by multiplying
+// its coordinates and r by U, with no offset (scaleFill). Layer.gradient is in viewBox units.
+// ---------------------------------------------------------------------------------------------
+
+/** A colour stop: offset in [0, 1] along the ramp, sRGB colour 0..255 per channel (not rounded). */
+export interface GradientStop {
+  offset: number;
+  color: RGB;
+}
+
+/**
+ * SVG linearGradient (gradientUnits userSpaceOnUse, spreadMethod pad): t = projection of the point on
+ * (x2 - x1, y2 - y1) divided by its squared length, clamped to [0, 1]. Stops non-decreasing in offset.
+ */
+export interface LinearGradient {
+  kind: 'linear';
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+  stops: GradientStop[];
+}
+
+/** SVG radialGradient (userSpaceOnUse, no fx/fy, pad): t = distance to (cx, cy) / r, clamped to [0, 1]. */
+export interface RadialGradient {
+  kind: 'radial';
+  cx: number;
+  cy: number;
+  r: number;
+  stops: GradientStop[];
+}
+
+export type Gradient = LinearGradient | RadialGradient;
+
+export interface SolidFill {
+  kind: 'solid';
+  color: RGB;
+}
+
+/** What paints a region: a flat colour or a gradient (same coordinate convention). */
+export type Fill = SolidFill | Gradient;
+
+/** Region id per pixel (0..count-1); -1 = no region. Int32: unlike LabelMap, not limited to 256. */
+export interface RegionMap {
+  data: Int32Array;
+  width: number;
+  height: number;
+  count: number;
+}
+
+/**
+ * Edge-based segmentation of an image into regions (core/regions.ts segmentRegions), at the resolution
+ * it ran on (1x or a proxy). Defined here so that core/fillModel.ts does not import core/regions.ts.
+ */
+export interface Segmentation {
+  /** Region per pixel: every pixel with alpha >= 128 has one (the edge band is grown into the regions); -1 below. */
+  regions: RegionMap;
+  /** 1 = edge pixel (hysteresis on the RGB Laplacian and Sobel maps). */
+  edge: BinaryMask;
+  /**
+   * 1 = core pixel: alpha >= 128 and not edge; in a thin region (a stroke or ramp the edge band covers, see segmentRegions)
+   * its pixels that are not a blend of their neighbours. Every region has at least one. Model fits use only these.
+   */
+  core: BinaryMask;
+  /** Pixels per region (core and band), length regions.count. */
+  area: Float64Array;
+  /** adjacency[i] = ids of the regions 4-adjacent to region i, ascending, without i and without repeats. */
+  adjacency: Int32Array[];
+  /** Noise estimate (Immerkaer, levels) the edge thresholds were scaled with. */
+  sigma: number;
+  /** Edge pixels with alpha >= 128 / pixels with alpha >= 128 (0 when there is none). */
+  edgeShare: number;
+}
+
+/** The model chosen for one region (core/fillModel.ts selectModel). */
+export interface RegionModel {
+  /** In continuous coordinates of the image it was fitted on (see the convention above); stops normalised. */
+  fill: Fill;
+  /** RMSE (levels, pooled over R, G and B) of `fill` on the region's core pixels. */
+  rmse: number;
+  /** RMSE of the flat model (mean colour) on the same pixels. */
+  rmseFlat: number;
+  /** Core pixels the fit used. */
+  coreCount: number;
+  /** No model passed the ladder; `fill` is then the candidate with the lowest RMSE. */
+  complex: boolean;
+}
+
+/** Gradient-mode probe the classifier runs on a <= 512 px proxy (core/classify.ts probeGradients). */
+export interface GradientProbe {
+  /** Immerkaer noise estimate of the proxy (levels). */
+  sigma: number;
+  /** Regions after merging. */
+  regions: number;
+  /**
+   * Share of the labelled area explained: the regions whose model has rmse <= max(2.5, 2σ) on their core, less their
+   * pixels at least 2 px inside them that the model misses by more than 2·sobHi levels (a shape the segmentation handed
+   * to them). 0 where gradient mode falls back (edge share, region count or complex share).
+   */
+  explained: number;
+  /** Share of the labelled area in regions painted with a linear gradient. */
+  linearShare: number;
+  /** Share of the labelled area in regions painted with a radial gradient. */
+  radialShare: number;
+  /** Segmentation.edgeShare of the proxy. */
+  edgeShare: number;
+}
+
 /** A traced layer, coordinates in viewBox units (upscaled pixels). */
 export interface Layer {
-  fill: string; // '#rrggbb'
+  fill: string; // '#rrggbb'; with `gradient`, the mean colour of its stops (what readers that ignore it paint)
+  /** Gradient mode: the gradient that paints the layer, in viewBox units like the paths. */
+  gradient?: Gradient;
   opacity?: number; // 0..1, omitted when 1
   paths: AbsPath[];
 }
@@ -175,7 +300,9 @@ export type WarningCode =
   /** lines/flat: the image is not blank but the trace came out without any ink. */
   | 'empty-trace'
   /** A fake-transparency checkerboard painted into the pixels was treated as transparent. */
-  | 'baked-checkerboard';
+  | 'baked-checkerboard'
+  /** gradient: the image could not be rebuilt with gradients and was traced as a 16-colour flat palette. */
+  | 'gradient-fallback';
 
 export interface Warning {
   code: WarningCode;
@@ -235,6 +362,12 @@ export interface SourceInfo {
    * was asked to keep it (analyzeSource(img, 'keep')).
    */
   bakedBackground: BakedCheckerboard | null;
+  /**
+   * Gradient-mode probe (classify.ts probeGradients, <= 512 px proxy). Computed on the branch that would end in
+   * 'photo' (no exact palette, or offPaletteShare > 0.15) and when the exact palette has GRADIENT_PROBE_MIN_COLORS (8)
+   * or more colours (the staircase a smooth ramp leaves); null otherwise.
+   */
+  gradientProbe: GradientProbe | null;
 }
 
 export interface ClassifyResult {

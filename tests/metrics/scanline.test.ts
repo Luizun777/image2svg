@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import type { AbsPath, Layer, RasterImage } from '../../src/types';
+import type { AbsPath, Gradient, GradientStop, Layer, RasterImage, RGB } from '../../src/types';
+import { evaluateFill } from '../../src/core/fillEval';
 import { flattenPath, rasterizeLayers, rasterizeMask } from '../../src/metrics/scanline';
 
 /** Axis-aligned rectangle [x0,x1) x [y0,y1); `ccw` reverses the orientation. */
@@ -499,5 +500,300 @@ describe('rasterizeLayers', () => {
       const expected = 255 - cov.data[i];
       expect(Math.abs(img.data[i * 4] - expected)).toBeLessThanOrEqual(0.51);
     }
+  });
+});
+
+/** Full-image rectangle painted by `gradient`; `fill` is its reserve colour. */
+function gradientLayer(w: number, h: number, gradient: Gradient, fill = '#808080'): Layer {
+  return { fill, gradient, paths: [rectPath(0, 0, w, h)] };
+}
+
+/** 0..255 with NaN -> 0, what an SVG stop-color can hold. */
+function level(v: number): number {
+  return v > 0 ? (v < 255 ? v : 255) : 0;
+}
+
+/** Largest channel difference between an opaque raster and evaluateFill (clamped) at every pixel centre. */
+function maxDiffFromEvaluateFill(img: RasterImage, g: Gradient): number {
+  const c: RGB = [0, 0, 0];
+  let worst = 0;
+  for (let y = 0; y < img.height; y++) {
+    for (let x = 0; x < img.width; x++) {
+      evaluateFill(g, x + 0.5, y + 0.5, c);
+      const p = px(img, x, y);
+      for (let k = 0; k < 3; k++) worst = Math.max(worst, Math.abs(p[k] - level(c[k])));
+    }
+  }
+  return worst;
+}
+
+const GRAY_RAMP: GradientStop[] = [
+  { offset: 0, color: [0, 0, 0] },
+  { offset: 1, color: [255, 255, 255] },
+];
+
+describe('rasterizeLayers with gradients', () => {
+  it('64x16 rect, linear 0 -> 255 from x1 = 0 to x2 = 64: column x = round(255 (x + 0.5) / 64) +- 1', () => {
+    const g: Gradient = { kind: 'linear', x1: 0, y1: 0, x2: 64, y2: 0, stops: GRAY_RAMP };
+    for (const bg of [[255, 255, 255], [10, 200, 30], null] as Array<RGB | null>) {
+      const img = rasterizeLayers([gradientLayer(64, 16, g)], 64, 16, bg);
+      for (let y = 0; y < 16; y++) {
+        for (let x = 0; x < 64; x++) {
+          const expected = Math.round((255 * (x + 0.5)) / 64);
+          const p = px(img, x, y);
+          for (let k = 0; k < 3; k++) expect(Math.abs(p[k] - expected)).toBeLessThanOrEqual(1);
+          expect(p[3]).toBe(255);
+        }
+      }
+    }
+  });
+
+  it('linear from x1 = 16 to x2 = 48: first colour before x1, last colour after x2 (pad), ramp between', () => {
+    const g: Gradient = { kind: 'linear', x1: 16, y1: 5, x2: 48, y2: 5, stops: GRAY_RAMP };
+    const img = rasterizeLayers([gradientLayer(64, 16, g)], 64, 16, [255, 0, 0]);
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 64; x++) {
+        const p = px(img, x, y);
+        if (x + 0.5 <= 16) expect(p).toEqual([0, 0, 0, 255]);
+        else if (x + 0.5 >= 48) expect(p).toEqual([255, 255, 255, 255]);
+        else {
+          const expected = Math.round((255 * (x + 0.5 - 16)) / 32);
+          for (let k = 0; k < 3; k++) expect(Math.abs(p[k] - expected)).toBeLessThanOrEqual(1);
+        }
+      }
+    }
+  });
+
+  it('radial: centre pixel = first stop, rho >= r = last stop (pad), halfway between stops interpolated', () => {
+    const stops: GradientStop[] = [
+      { offset: 0, color: [255, 220, 0] },
+      { offset: 0.5, color: [230, 20, 40] },
+      { offset: 1, color: [10, 20, 110] },
+    ];
+    const g: Gradient = { kind: 'radial', cx: 32.5, cy: 32.5, r: 20, stops };
+    const img = rasterizeLayers([gradientLayer(64, 64, g)], 64, 64, [255, 255, 255]);
+    const centre = px(img, 32, 32);
+    [255, 220, 0].forEach((v, k) => expect(Math.abs(centre[k] - v)).toBeLessThanOrEqual(1));
+    let padded = 0;
+    for (let y = 0; y < 64; y++) {
+      for (let x = 0; x < 64; x++) {
+        if (Math.hypot(x + 0.5 - 32.5, y + 0.5 - 32.5) < 20) continue;
+        expect(px(img, x, y)).toEqual([10, 20, 110, 255]);
+        padded++;
+      }
+    }
+    expect(padded).toBeGreaterThan(2700); // 64² - π 20² ≈ 2839
+    // rho = 5 (t = 0.25): halfway between the first two stops; rho = 15 (t = 0.75): between the last two.
+    const q1 = px(img, 37, 32);
+    [242.5, 120, 20].forEach((v, k) => expect(Math.abs(q1[k] - v)).toBeLessThanOrEqual(2));
+    const q2 = px(img, 32, 47);
+    [120, 20, 75].forEach((v, k) => expect(Math.abs(q2[k] - v)).toBeLessThanOrEqual(2));
+    expect(maxDiffFromEvaluateFill(img, g)).toBeLessThanOrEqual(1);
+  });
+
+  it('every pixel within 1 level of evaluateFill at its centre: many stops, steep ramps, hard stops, odd input', () => {
+    const W = 256;
+    const H = 24;
+    const lin = (stops: GradientStop[]): Gradient => ({ kind: 'linear', x1: 0, y1: 0, x2: 256, y2: 16, stops });
+    const cases: Gradient[] = [
+      // 8 stops at an angle, ramp ends inside the image.
+      {
+        kind: 'linear',
+        x1: 30.7,
+        y1: 20.2,
+        x2: 201.9,
+        y2: 3.4,
+        stops: Array.from({ length: 8 }, (_, i) => ({
+          offset: i / 7,
+          color: [(i * 97) % 256, (i * 53 + 20) % 256, 255 - ((i * 31) % 256)] as RGB,
+        })),
+      },
+      // 255 levels over 0.1 of t: a plain 256-entry table would be up to 5 levels off.
+      lin([
+        { offset: 0.45, color: [0, 0, 0] },
+        { offset: 0.55, color: [255, 128, 64] },
+      ]),
+      // 255 levels over 0.005 of t: steeper than any table, evaluated exactly.
+      lin([
+        { offset: 0.5, color: [0, 0, 0] },
+        { offset: 0.505, color: [255, 255, 255] },
+      ]),
+      // Hard stop (two stops at one offset) and stops outside [0, 1].
+      lin([
+        { offset: -0.5, color: [0, 0, 255] },
+        { offset: 0.4, color: [0, 255, 0] },
+        { offset: 0.4, color: [255, 0, 0] },
+        { offset: 1.5, color: [255, 255, 0] },
+      ]),
+      // Decreasing offsets, out-of-range and non-finite colours (clamped like the SVG hex).
+      lin([
+        { offset: 0, color: [-100, 300, 50] },
+        { offset: 0.8, color: [355, -40, 200] },
+        { offset: 0.3, color: [20, 30, 40] },
+        { offset: 1, color: [NaN, 10, 250] },
+      ]),
+      // Radial with the centre between pixels and one with the centre outside the image.
+      {
+        kind: 'radial',
+        cx: 100.3,
+        cy: 11.8,
+        r: 57.5,
+        stops: [
+          { offset: 0, color: [255, 255, 255] },
+          { offset: 0.2, color: [250, 126, 30] },
+          { offset: 0.65, color: [214, 41, 118] },
+          { offset: 1, color: [150, 47, 191] },
+        ],
+      },
+      { kind: 'radial', cx: -40, cy: 60, r: 200, stops: GRAY_RAMP },
+    ];
+    for (const g of cases) {
+      const img = rasterizeLayers([gradientLayer(W, H, g)], W, H, [255, 255, 255]);
+      expect(maxDiffFromEvaluateFill(img, g)).toBeLessThanOrEqual(1);
+      for (let o = 3; o < img.data.length; o += 4) expect(img.data[o]).toBe(255);
+    }
+  });
+
+  it('coverage, opacity and back-to-front order blend the gradient colour like a solid fill', () => {
+    const g: Gradient = {
+      kind: 'linear',
+      x1: 0,
+      y1: 0,
+      x2: 16,
+      y2: 16,
+      stops: [
+        { offset: 0, color: [0, 64, 255] },
+        { offset: 1, color: [255, 200, 0] },
+      ],
+    };
+    const top = [rectPath(4.5, 2, 14, 13.25)];
+    const cov = rasterizeMask(top, 16, 16);
+    const onGrey = rasterizeLayers([{ fill: '#808080', opacity: 0.5, gradient: g, paths: top }], 16, 16, [100, 100, 100]);
+    const onRed = rasterizeLayers(
+      [
+        { fill: '#ff0000', paths: [rectPath(0, 0, 16, 16)] },
+        { fill: '#808080', opacity: 0.5, gradient: g, paths: top },
+      ],
+      16,
+      16,
+      null,
+    );
+    const alone = rasterizeLayers([{ fill: '#808080', gradient: g, paths: top }], 16, 16, null);
+    const covered = rasterizeLayers(
+      [
+        { fill: '#808080', gradient: g, paths: top },
+        { fill: '#00ff00', paths: [rectPath(0, 0, 16, 16)] },
+      ],
+      16,
+      16,
+      null,
+    );
+    const c: RGB = [0, 0, 0];
+    let partial = 0;
+    for (let y = 0; y < 16; y++) {
+      for (let x = 0; x < 16; x++) {
+        evaluateFill(g, x + 0.5, y + 0.5, c);
+        const a = at(cov, x, y) / 255;
+        if (a > 0 && a < 1) partial++;
+        const pg = px(onGrey, x, y);
+        for (let k = 0; k < 3; k++) expect(Math.abs(pg[k] - (c[k] * a * 0.5 + 100 * (1 - a * 0.5)))).toBeLessThanOrEqual(1);
+        expect(pg[3]).toBe(255);
+        const pr = px(onRed, x, y);
+        const red = [255, 0, 0];
+        for (let k = 0; k < 3; k++) expect(Math.abs(pr[k] - (c[k] * a * 0.5 + red[k] * (1 - a * 0.5)))).toBeLessThanOrEqual(1);
+        expect(pr[3]).toBe(255);
+        const pa = px(alone, x, y);
+        if (a === 0) expect(pa).toEqual([0, 0, 0, 0]);
+        else {
+          for (let k = 0; k < 3; k++) expect(Math.abs(pa[k] - c[k])).toBeLessThanOrEqual(1); // straight colour
+          expect(Math.abs(pa[3] - 255 * a)).toBeLessThanOrEqual(0.51);
+        }
+        expect(px(covered, x, y)).toEqual([0, 255, 0, 255]);
+      }
+    }
+    expect(partial).toBeGreaterThan(10); // the AA column x = 4 and row y = 13 were checked
+  });
+
+  it('a degenerate gradient paints layer.fill: byte-identical to the solid layer', () => {
+    const paths = [rectPath(2, 2, 13.5, 11)];
+    const solid = rasterizeLayers([{ fill: '#3366cc', paths }], 16, 16, null);
+    const degenerate: Gradient[] = [
+      { kind: 'linear', x1: 5, y1: 5, x2: 5, y2: 5, stops: GRAY_RAMP },
+      { kind: 'radial', cx: 8, cy: 8, r: 0, stops: GRAY_RAMP },
+      { kind: 'radial', cx: Number.NaN, cy: 8, r: 5, stops: GRAY_RAMP },
+      { kind: 'linear', x1: 0, y1: 0, x2: 16, y2: 0, stops: [{ offset: 0, color: [0, 0, 0] }] },
+      {
+        kind: 'linear',
+        x1: 0,
+        y1: 0,
+        x2: 16,
+        y2: 0,
+        stops: [
+          { offset: 0, color: [100, 100, 100] },
+          { offset: 1, color: [101, 100.5, 99] },
+        ],
+      },
+    ];
+    for (const g of degenerate) {
+      const img = rasterizeLayers([{ fill: '#3366cc', gradient: g, paths }], 16, 16, null);
+      expect(Array.from(img.data)).toEqual(Array.from(solid.data));
+    }
+  });
+
+  it('validates the reserve fill of gradient layers too and never mutates the layers', () => {
+    const g: Gradient = { kind: 'radial', cx: 4, cy: 4, r: 3, stops: GRAY_RAMP };
+    expect(() => rasterizeLayers([{ fill: 'url(#g0)', gradient: g, paths: [rectPath(0, 0, 8, 8)] }], 8, 8, null)).toThrow(
+      /relleno/,
+    );
+    const layers: Layer[] = [
+      gradientLayer(8, 8, { kind: 'linear', x1: 0, y1: 0, x2: 8, y2: 8, stops: GRAY_RAMP }),
+      { fill: '#123456', gradient: g, paths: [rectPath(1, 1, 7, 7)] },
+    ];
+    const before = JSON.stringify(layers);
+    rasterizeLayers(layers, 8, 8, [0, 0, 0]);
+    expect(JSON.stringify(layers)).toBe(before);
+  });
+});
+
+/**
+ * Opt-in (BENCH=1, the timing depends on the machine load): the per-pixel gradient colour must stay cheap next to
+ * the coverage sweep. Measured 2026-09-11 (Node 26, vitest 5, best of 9 interleaved runs, 2000x2000, 2 stops):
+ * full rect on white solid 30.6 ms, linear 43.4 ms (1.42x), radial 63.0 ms (2.06x); transparent 1.41x / 2.08x;
+ * disc r 990 on white 1.53x / 2.45x. The radial cost is Math.hypot inside fillEval.gradientT: the same loop with
+ * Math.sqrt measured 1.16x with byte-identical output.
+ */
+describe.skipIf(process.env.BENCH !== '1')('rasterizeLayers gradient cost (BENCH=1)', () => {
+  it('a 2000x2000 linear gradient layer takes at most 1.5x the time of the same solid layer', () => {
+    const N = 2000;
+    const paths = [rectPath(0, 0, N, N)];
+    const solid: Layer = { fill: '#808080', paths };
+    const linear: Layer = {
+      fill: '#808080',
+      paths,
+      gradient: {
+        kind: 'linear',
+        x1: 100,
+        y1: 300,
+        x2: 1900,
+        y2: 1700,
+        stops: [
+          { offset: 0, color: [10, 200, 30] },
+          { offset: 1, color: [240, 20, 180] },
+        ],
+      },
+    };
+    const time = (layer: Layer): number => {
+      const t0 = performance.now();
+      rasterizeLayers([layer], N, N, [255, 255, 255]);
+      return performance.now() - t0;
+    };
+    for (let i = 0; i < 2; i++) time(solid) + time(linear); // warm-up
+    let bestSolid = Number.POSITIVE_INFINITY;
+    let bestLinear = Number.POSITIVE_INFINITY;
+    for (let rep = 0; rep < 9; rep++) {
+      bestSolid = Math.min(bestSolid, time(solid));
+      bestLinear = Math.min(bestLinear, time(linear));
+    }
+    expect(bestLinear / bestSolid).toBeLessThanOrEqual(1.5);
   });
 });

@@ -11,7 +11,9 @@
  *     the path's own transform, joined by a space so `parseTransform` composes them in SVG
  *     order; null when nobody carries a transform.
  *
- * XML comments and `<![CDATA[…]]>` sections are stripped before scanning. Pure function.
+ * XML comments and `<![CDATA[…]]>` sections are stripped before scanning, and everything inside
+ * `<defs>…</defs>` is skipped (its content is never rendered directly: gradients, and any path a
+ * `<use>` could reference). Pure function.
  */
 
 export interface ExtractedPath {
@@ -20,8 +22,8 @@ export interface ExtractedPath {
   transform: string | null;
 }
 
-/** Matches an opening/self-closing <g>, <svg> or <path> tag, or a closing </g> / </svg>. */
-const TAG_RE = /<(g|svg|path)\b([^>]*)>|<\/(g|svg)\s*>/g;
+/** Matches an opening/self-closing <g>, <svg>, <path> or <defs> tag, or a closing </g>, </svg> or </defs>. */
+const TAG_RE = /<(g|svg|path|defs)\b([^>]*)>|<\/(g|svg|defs)\s*>/g;
 const COMMENT_RE = /<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>/g;
 
 /**
@@ -55,11 +57,17 @@ export function extractPaths(svg: string): ExtractedPath[] {
   const src = svg.replace(COMMENT_RE, '');
   const stack: Container[] = [];
   const re = new RegExp(TAG_RE.source, 'g');
+  let defsDepth = 0; // > 0 while inside <defs>: nothing there is collected or affects the container stack
   let m: RegExpExecArray | null;
   while ((m = re.exec(src)) !== null) {
     if (m[3] !== undefined) {
-      // Closing tag: pop the nearest matching container (tolerates stray closers).
       const closing = m[3];
+      if (closing === 'defs') {
+        if (defsDepth > 0) defsDepth--;
+        continue;
+      }
+      if (defsDepth > 0) continue;
+      // Closing tag: pop the nearest matching container (tolerates stray closers).
       for (let i = stack.length - 1; i >= 0; i--) {
         if (stack[i].tag === closing) {
           stack.length = i;
@@ -71,6 +79,11 @@ export function extractPaths(svg: string): ExtractedPath[] {
     const tag = m[1];
     let attrs = m[2];
     const selfClosing = attrs.length > 0 && attrs.charCodeAt(attrs.length - 1) === 47; // '/'
+    if (tag === 'defs') {
+      if (!selfClosing) defsDepth++;
+      continue;
+    }
+    if (defsDepth > 0) continue;
     if (selfClosing) attrs = attrs.slice(0, -1);
     // Leading space guarantees `readAttr`'s whitespace guard works for the first attribute.
     attrs = ` ${attrs}`;

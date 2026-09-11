@@ -8,7 +8,7 @@ Vectorizador raster → SVG 100 % en el navegador que elimina los "picos" (reesc
 - Deploy: GitHub Pages bajo `/image2svg/` con `.github/workflows/deploy.yml`.
 
 ## Comandos
-- `npm run dev` → http://localhost:5173/image2svg/ (`?synth=circle|line|glyph|flat|sprite|logo` solo en dev)
+- `npm run dev` → http://localhost:5173/image2svg/ (`?synth=circle|line|glyph|flat|sprite|logo|gradient|radial` solo en dev)
 - `npm run typecheck` (3 tsconfig: app, worker, tests)
 - `npx vitest run <archivo>` — test del archivo tocado; `npm test` completo solo si se pide
 - `BENCH=1 npx vitest run tests/bench` — imágenes reales de `samples/` (generar con `scripts/prepare-samples.sh` desde `img/`)
@@ -25,6 +25,7 @@ Vectorizador raster → SVG 100 % en el navegador que elimina los "picos" (reesc
 - `esm-potrace-wasm` solo se importa en el worker (parchea `TextDecoder`), solo acepta `ImageData`, `extractcolors:false` explícito, y si aborta hay que recrear el worker.
 - `vtracer-web`: iniciar con URL explícita del wasm (`?url`), ángulos en radianes, todas las claves de config obligatorias; `filterSpeckle` es área en px² (escalar ×U² como `turdsize`).
 - Rasterizar SVG solo en main thread vía `data:` URL; raíz con `width`, `height` y `viewBox`.
+- Modo Degradados: el relleno con degradado viaja en `Layer.gradient` (unidades del viewBox; `Layer.fill` queda como color medio de reserva) y se evalúa siempre con `src/core/fillEval.ts` (convención de centro de píxel en `types.ts`); rasterizador, tuner y fixtures no reimplementan `t`. Los tests leen `<defs>` y `url(#…)` (ids `g<h>-<n>`, únicos por documento) con `tests/fixtures/svgBack.ts parseSvg`, no con regex propias. Sin degradados, las salidas de flat, lines y pixel deben quedar byte-idénticas.
 - Textos de UI en español y sin em-dashes. `img/` y `samples/` son imágenes reales del usuario: nunca commitear ni publicar.
 
 ## Lecciones aprendidas

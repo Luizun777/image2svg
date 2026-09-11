@@ -7,6 +7,7 @@ import type {
   BakedCheckerboard,
   ConcreteMode,
   Engine,
+  SourceInfo,
   TraceParams,
   Warning,
   WarningCode,
@@ -23,6 +24,7 @@ export const WARNING_TITLE: Record<WarningCode, string> = {
   'engine-unavailable': 'Motor no disponible',
   'empty-trace': 'El SVG ha salido vacío',
   'baked-checkerboard': 'Transparencia falsa',
+  'gradient-fallback': 'Degradados no reconstruidos',
 };
 
 export interface WarningContext {
@@ -33,6 +35,20 @@ export interface WarningContext {
   engines: Record<Engine, boolean> | null;
   /** Upscale factor the last trace used; null when unknown. */
   resolvedUpscale: number | null;
+  /** The classifier's gradient probe explains enough of the source for Degradados (isGradientCandidate). */
+  gradientCandidate: boolean;
+}
+
+/**
+ * Share of the labelled area the gradient probe must explain (solid, linear or radial regions) before the
+ * 'photo' banner offers Degradados instead of more colours. Plan value: the classifier's own threshold to pick
+ * gradient is higher (0.85); between the two the image stays a photo but gradients are worth a try.
+ */
+export const GRADIENT_CANDIDATE_MIN_EXPLAINED = 0.5;
+
+/** True when SourceInfo.gradientProbe explains at least GRADIENT_CANDIDATE_MIN_EXPLAINED of the image. */
+export function isGradientCandidate(info: Pick<SourceInfo, 'gradientProbe'>): boolean {
+  return (info.gradientProbe?.explained ?? 0) >= GRADIENT_CANDIDATE_MIN_EXPLAINED;
 }
 
 export interface WarningAction {
@@ -42,7 +58,9 @@ export interface WarningAction {
 
 /**
  * Trace warnings first, then classifier warnings whose code is not already present. The
- * classifier's 'thin-strokes' only applies to line tracing, so it is dropped in other modes.
+ * classifier's 'thin-strokes' only applies to line tracing, so it is dropped in other modes; its
+ * 'photo' warning describes the 16-colour flat palette and suggests Degradados, so it is dropped in
+ * gradient mode (where a failed reconstruction brings its own 'gradient-fallback').
  */
 export function mergeWarnings(
   traceWarnings: readonly Warning[],
@@ -59,6 +77,7 @@ export function mergeWarnings(
   for (const w of classifyWarnings) {
     if (seen.has(w.code)) continue;
     if (w.code === 'thin-strokes' && mode !== 'lines') continue;
+    if (w.code === 'photo' && mode === 'gradient') continue;
     seen.add(w.code);
     out.push(w);
   }
@@ -68,6 +87,11 @@ export function mergeWarnings(
 const TO_FLAT: WarningAction = {
   label: 'Cambiar a Color plano',
   apply: (p) => ({ ...p, mode: 'flat' }),
+};
+
+const USE_GRADIENTS: WarningAction = {
+  label: 'Usar degradados',
+  apply: (p) => ({ ...p, mode: 'gradient' }),
 };
 
 const KEEP_CHECKERBOARD: WarningAction = {
@@ -158,6 +182,8 @@ export function warningAction(warning: Warning, ctx: WarningContext): WarningAct
   const engine: Engine = params.engine ?? d.engine;
   switch (warning.code) {
     case 'photo': {
+      // Gradients the probe can explain are rebuilt by Degradados; more flat colours would only add bands.
+      if (mode !== 'gradient' && ctx.gradientCandidate) return USE_GRADIENTS;
       if (mode !== 'flat') return TO_FLAT;
       if (params.colors === 32) return null;
       return {
@@ -182,7 +208,8 @@ export function warningAction(warning: Warning, ctx: WarningContext): WarningAct
       if (mode === 'lines') {
         return suggestsAlphaMask(warning) && (params.alphaMode ?? d.alphaMode) !== 'mask' ? USE_ALPHA_MASK : TO_FLAT;
       }
-      if (mode !== 'flat') return null;
+      // Flat and gradient trace one mask per layer: a speckle filter larger than the shapes empties both.
+      if (mode !== 'flat' && mode !== 'gradient') return null;
       const speckle =
         engine === 'vtracer'
           ? (params.vtracer?.filterSpeckle ?? VTRACER_DEFAULTS.filterSpeckle)
@@ -208,6 +235,9 @@ export function warningAction(warning: Warning, ctx: WarningContext): WarningAct
       const uiMode = params.mode === undefined || params.mode === 'auto' ? mode : params.mode;
       return uiMode === 'lines' ? KEEP_CHECKERBOARD_IN_FLAT : KEEP_CHECKERBOARD;
     }
+    case 'gradient-fallback':
+      // The trace already fell back to a 16-colour flat palette: Color plano gives its palette controls.
+      return TO_FLAT;
     case 'upscale-capped':
     case 'large-input':
       return null;

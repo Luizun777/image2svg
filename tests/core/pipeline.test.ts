@@ -4,7 +4,7 @@
  */
 import { describe, expect, it } from 'vitest';
 import type { BinaryMask, Engine, RasterImage, RGB, Tracer } from '../../src/types';
-import { prepareLines, trace } from '../../src/core/pipeline';
+import { prepareLines, trace, layerMask } from '../../src/core/pipeline';
 import { analyzeSource, classify } from '../../src/core/classify';
 import { resolveParams } from '../../src/core/params';
 import { countInk } from '../../src/core/morphology';
@@ -87,7 +87,7 @@ describe('lines threshold: 50 % coverage iso-level between ink and paper', () =>
     const { image } = disc([255, 165, 0], WHITE);
     const info = analyzeSource(image);
     const ink = (thresholdOffset: number): number =>
-      countInk(prepareLines(image, resolveParams({ mode: 'lines', upscale: 2, thresholdOffset }, image), info).layers[0].mask);
+      countInk(layerMask(prepareLines(image, resolveParams({ mode: 'lines', upscale: 2, thresholdOffset }, image), info).layers[0]));
     const base = ink(0);
     expect(base).toBeGreaterThan(0);
     expect(ink(0.08)).toBeGreaterThan(base);

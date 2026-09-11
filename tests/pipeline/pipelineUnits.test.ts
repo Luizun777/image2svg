@@ -13,7 +13,7 @@ import type {
   Tracer,
   TracerOptions,
 } from '../../src/types';
-import { prepareFlat, prepareLines, trace, TOO_MANY_RECTS } from '../../src/core/pipeline';
+import { layerMask, prepareFlat, prepareLines, trace, TOO_MANY_RECTS } from '../../src/core/pipeline';
 import { analyzeSource } from '../../src/core/classify';
 import { resolveParams } from '../../src/core/params';
 import { buildPalette, toHex } from '../../src/core/palette';
@@ -224,13 +224,13 @@ describe('prepareLines', () => {
     expect(p.U).toBe(1);
     expect(p.layers).toHaveLength(1);
     expect(p.layers[0].fill).toBe('#000000');
-    expect(maskIoU(p.layers[0].mask, maskAt(1))).toBeGreaterThan(0.95);
+    expect(maskIoU(layerMask(p.layers[0]), maskAt(1))).toBeGreaterThan(0.95);
     const inv = prepareLines(image, resolveParams({ mode: 'lines', upscale: 1, blurK: 0, invert: true }, image), info);
-    expect(countInk(inv.layers[0].mask) + countInk(p.layers[0].mask)).toBe(64 * 64);
+    expect(countInk(layerMask(inv.layers[0])) + countInk(layerMask(p.layers[0]))).toBe(64 * 64);
     const up = prepareLines(image, resolveParams({ mode: 'lines', upscale: 4 }, image), info);
     expect(up.U).toBe(4);
-    expect(up.layers[0].mask.width).toBe(256);
-    expect(maskIoU(up.layers[0].mask, maskAt(4))).toBeGreaterThan(0.97);
+    expect(layerMask(up.layers[0]).width).toBe(256);
+    expect(maskIoU(layerMask(up.layers[0]), maskAt(4))).toBeGreaterThan(0.97);
     expect(prepareLines(image, resolveParams({ mode: 'lines', fill: '#ff0000' }, image), info).layers[0].fill).toBe('#ff0000');
   });
 
@@ -238,13 +238,13 @@ describe('prepareLines', () => {
     const { image, maskAt } = transparentLogo();
     const info = analyzeSource(image);
     const p = prepareLines(image, resolveParams({ mode: 'lines', upscale: 2, blurK: 0 }, image), info);
-    expect(maskIoU(p.layers[0].mask, maskAt(2))).toBeGreaterThan(0.95);
+    expect(maskIoU(layerMask(p.layers[0]), maskAt(2))).toBeGreaterThan(0.95);
     expect(p.layers[0].fill).toBe('#1d3557');
     const fat = prepareLines(image, resolveParams({ mode: 'lines', upscale: 2, blurK: 0, thresholdOffset: -0.25 }, image), info);
     const thin = prepareLines(image, resolveParams({ mode: 'lines', upscale: 2, blurK: 0, thresholdOffset: 0.25 }, image), info);
-    expect(countInk(fat.layers[0].mask)).toBeGreaterThan(countInk(p.layers[0].mask));
-    expect(countInk(thin.layers[0].mask)).toBeLessThan(countInk(p.layers[0].mask));
-    assertMaskNested(fat.layers[0].mask, thin.layers[0].mask);
+    expect(countInk(layerMask(fat.layers[0]))).toBeGreaterThan(countInk(layerMask(p.layers[0])));
+    expect(countInk(layerMask(thin.layers[0]))).toBeLessThan(countInk(layerMask(p.layers[0])));
+    assertMaskNested(layerMask(fat.layers[0]), layerMask(thin.layers[0]));
   });
 });
 
@@ -254,15 +254,15 @@ describe('prepareFlat', () => {
     const p = prepareFlat(image, resolveParams({ mode: 'flat', upscale: 2 }, image), analyzeSource(image));
     expect(p.U).toBe(2);
     expect(p.layers).toHaveLength(3);
-    expect(countInk(p.layers[0].mask)).toBe(192 * 192);
+    expect(countInk(layerMask(p.layers[0]))).toBe(192 * 192);
     expect(p.layers[0].fill).toBe('#f2e8d5');
     const fills = p.layers.map((l) => l.fill);
     expect(fills).toContain('#2a6f97');
     expect(fills).toContain('#e07a5f');
     expect(palette.length).toBe(3);
-    assertMaskNested(p.layers[0].mask, p.layers[1].mask);
-    assertMaskNested(p.layers[1].mask, p.layers[2].mask);
-    expect(countInk(p.layers[1].mask)).toBeGreaterThan(countInk(p.layers[2].mask));
+    assertMaskNested(layerMask(p.layers[0]), layerMask(p.layers[1]));
+    assertMaskNested(layerMask(p.layers[1]), layerMask(p.layers[2]));
+    expect(countInk(layerMask(p.layers[1]))).toBeGreaterThan(countInk(layerMask(p.layers[2])));
   });
 
   it('transparent single colour: one layer covering only the opaque star, no full-canvas layer', () => {
@@ -271,10 +271,10 @@ describe('prepareFlat', () => {
     expect(p.layers).toHaveLength(1);
     expect(p.layers[0].fill).toBe('#1d3557');
     const star = maskAt(2);
-    expect(maskIoU(p.layers[0].mask, star)).toBeGreaterThan(0.95);
+    expect(maskIoU(layerMask(p.layers[0]), star)).toBeGreaterThan(0.95);
     // No ink where the source is transparent (even after the blur).
     let outside = 0;
-    for (let i = 0; i < star.data.length; i++) if (star.data[i] === 0 && p.layers[0].mask.data[i] !== 0) outside++;
+    for (let i = 0; i < star.data.length; i++) if (star.data[i] === 0 && layerMask(p.layers[0]).data[i] !== 0) outside++;
     expect(outside / countInk(star)).toBeLessThan(0.03);
   });
 
@@ -288,17 +288,17 @@ describe('prepareFlat', () => {
     expectHexNear(p.layers[1].fill, [200, 30, 30], 3); // exact-palette average, AA edges shift it slightly
     const S = star(4);
     const D = disc(4);
-    expect(maskIoU(p.layers[0].mask, S)).toBeGreaterThan(0.95);
-    expect(maskIoU(p.layers[1].mask, D)).toBeGreaterThan(0.9);
-    assertMaskNested(p.layers[0].mask, p.layers[1].mask);
+    expect(maskIoU(layerMask(p.layers[0]), S)).toBeGreaterThan(0.95);
+    expect(maskIoU(layerMask(p.layers[1]), D)).toBeGreaterThan(0.9);
+    assertMaskNested(layerMask(p.layers[0]), layerMask(p.layers[1]));
     for (const l of p.layers) {
       let outside = 0;
-      for (let i = 0; i < S.data.length; i++) if (S.data[i] === 0 && l.mask.data[i] !== 0) outside++;
+      for (let i = 0; i < S.data.length; i++) if (S.data[i] === 0 && layerMask(l).data[i] !== 0) outside++;
       expect(outside / countInk(S)).toBeLessThan(0.03);
     }
     // The white garbage never becomes a layer, and the edge of the star is navy, not whitish:
     // the navy mask must reach the star boundary (premultiplied resampling).
-    expect(countInk(p.layers[0].mask) / countInk(S)).toBeGreaterThan(0.95);
+    expect(countInk(layerMask(p.layers[0])) / countInk(S)).toBeGreaterThan(0.95);
 
     // End to end: no <rect>, exactly two <path>, transparency preserved when rendered.
     const { tracers } = fakes();
@@ -323,13 +323,13 @@ describe('prepareFlat', () => {
     // Without upscale or blur both colours keep their pixels: nested layers of 320 and 64 px.
     const sharp = prepareFlat(image, resolveParams({ mode: 'flat', upscale: 1, blurK: 0 }, image), info);
     expect(sharp.layers.map((l) => l.fill)).toEqual(['#c81e1e', '#1e3cc8']);
-    expect(sharp.layers.map((l) => countInk(l.mask))).toEqual([320, 64]);
+    expect(sharp.layers.map((l) => countInk(layerMask(l)))).toEqual([320, 64]);
     // Labels are assigned after upscale 4 + blur sigma 4 px: the blocks fade below alpha 128, so blue
     // gets 0 pixels and must not become an (empty) layer.
     const params = { mode: 'flat', upscale: 4, blurK: 1 } as const;
     const p = prepareFlat(image, resolveParams(params, image), info);
     expect(p.layers.map((l) => l.fill)).toEqual(['#c81e1e']);
-    expect(maskIoU(p.layers[0].mask, square(4))).toBeGreaterThan(0.95);
+    expect(maskIoU(layerMask(p.layers[0]), square(4))).toBeGreaterThan(0.95);
     // End to end: the tracer runs once (red).
     const { tracers, calls } = fakes();
     const r = await trace(image, params, tracers, info);

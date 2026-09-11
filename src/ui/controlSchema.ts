@@ -137,11 +137,14 @@ const always = (): boolean => true;
 const notPixel = (ctx: ControlContext): boolean => ctx.mode !== 'pixel';
 const isLines = (ctx: ControlContext): boolean => ctx.mode === 'lines';
 const isFlat = (ctx: ControlContext): boolean => ctx.mode === 'flat';
+const isGradient = (ctx: ControlContext): boolean => ctx.mode === 'gradient';
+/** Modes whose output is one layer per colour or region, stacked or cut out. */
+const hasRegionLayers = (ctx: ControlContext): boolean => ctx.mode === 'flat' || ctx.mode === 'gradient';
 const isPixel = (ctx: ControlContext): boolean => ctx.mode === 'pixel';
 const potraceTrace = (ctx: ControlContext): boolean => notPixel(ctx) && engineOf(ctx) === 'potrace';
 const vtracerTrace = (ctx: ControlContext): boolean => notPixel(ctx) && engineOf(ctx) === 'vtracer';
 
-type NumberKey = 'alphamax' | 'thresholdOffset' | 'blurK' | 'opttolerance' | 'turdsize';
+type NumberKey = 'alphamax' | 'thresholdOffset' | 'blurK' | 'opttolerance' | 'turdsize' | 'regionDetail' | 'maxStops';
 
 function numberParam(key: NumberKey): Pick<SliderControl, 'get' | 'set' | 'param'> {
   return {
@@ -172,7 +175,7 @@ function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
 
-const MODES: readonly Mode[] = ['auto', 'lines', 'flat', 'pixel'];
+const MODES: readonly Mode[] = ['auto', 'lines', 'flat', 'gradient', 'pixel'];
 
 function toMode(value: string): Mode {
   return (MODES as readonly string[]).includes(value) ? (value as Mode) : 'auto';
@@ -306,6 +309,49 @@ export const CONTROLS: readonly ControlDef[] = [
     visible: isFlat,
     get: (ctx) => ctx.params.exactPalette ?? DEFAULTS[ctx.mode].exactPalette,
     set: (params, value) => ({ ...params, exactPalette: value }),
+  },
+  // Degradados: where Color plano shows its palette, the segmentation and gradient-fit knobs.
+  {
+    id: 'regionDetail',
+    kind: 'slider',
+    label: 'Detalle de regiones',
+    section: 'main',
+    group: 'trace',
+    min: 0.5,
+    max: 2,
+    step: 0.1,
+    decimals: 1,
+    minLabel: 'Menos regiones',
+    maxLabel: 'Más regiones',
+    hint: 'Cuánto separa dos zonas de color parecido: más alto encuentra más formas.',
+    visible: isGradient,
+    ...numberParam('regionDetail'),
+  },
+  {
+    id: 'maxStops',
+    kind: 'slider',
+    label: 'Paradas máximas',
+    section: 'main',
+    group: 'trace',
+    min: 2,
+    max: 8,
+    step: 1,
+    decimals: 0,
+    hint: 'Número máximo de colores en cada degradado.',
+    visible: isGradient,
+    ...numberParam('maxStops'),
+  },
+  {
+    id: 'radialGradients',
+    kind: 'toggle',
+    label: 'Degradados radiales',
+    section: 'main',
+    group: 'trace',
+    param: 'radialGradients',
+    hint: 'Permite degradados circulares además de los lineales.',
+    visible: isGradient,
+    get: (ctx) => ctx.params.radialGradients ?? DEFAULTS[ctx.mode].radialGradients,
+    set: (params, value) => ({ ...params, radialGradients: value }),
   },
   // ---- Avanzado · Trazado -------------------------------------------------------------------
   {
@@ -473,12 +519,14 @@ export const CONTROLS: readonly ControlDef[] = [
       { value: 'cutout', label: 'Recortadas' },
     ],
     hint: 'Apiladas: sin costuras entre colores. Recortadas: formas sin solaparse.',
-    visible: isFlat,
+    visible: hasRegionLayers,
     get: (ctx) => ctx.params.layering ?? DEFAULTS[ctx.mode].layering,
     set: (params, value) => ({
       ...params,
       layering: (value === 'cutout' ? 'cutout' : 'stacked') satisfies Layering,
     }),
+    // Flat defaults to stacked layers; gradient cuts every shape out, so the default needs saying.
+    note: (ctx) => (isGradient(ctx) ? 'Recortadas por defecto: cada forma con su propio degradado, editable.' : null),
   },
   {
     id: 'gridScale',

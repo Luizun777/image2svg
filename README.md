@@ -18,9 +18,10 @@ píxeles distintos) y muestra un mapa de diferencias.
 
 | Modo | Para qué | Cómo se traza |
 | --- | --- | --- |
-| **Auto** | Cualquier imagen | Analiza la paleta, los bordes y la rejilla, elige uno de los tres modos siguientes y explica por qué. |
+| **Auto** | Cualquier imagen | Analiza la paleta, los bordes, los degradados y la rejilla, elige uno de los cuatro modos siguientes y explica por qué. Va a Degradados la imagen cuyas formas se explican con colores planos y degradados: sin paleta exacta, o con una paleta exacta de 8 colores o más si además tiene degradados (como un logo con plumas en rampa, cuya rampa deja una escalera de colores). Si no tiene paleta exacta y tampoco se explica así, se trata como foto y se avisa. |
 | **Líneas / logo** | Dibujos a línea, logos de un color, escaneos | Reescalado, desenfoque, umbral de iso-nivel (o la transparencia como máscara) y un único trazado relleno. |
-| **Color plano** | Ilustraciones y logos con pocos colores | Paleta exacta (o reducida si hay degradados), una máscara por color y capas apiladas sin costuras. |
+| **Color plano** | Ilustraciones y logos con pocos colores | Paleta exacta (o reducida si la imagen tiene demasiados colores), una máscara por color y capas apiladas sin costuras. |
+| **Degradados** | Logos e ilustraciones con degradados (plumas, iconos con brillo, fondos en rampa) | Divide la imagen en formas por sus bordes (laplaciano y Sobel con histéresis, umbrales según el ruido), ajusta a cada forma un color plano, un degradado lineal o uno radial con hasta 8 paradas, y emite cada forma como un trazado recortado con su propio `<linearGradient>` o `<radialGradient>`, editable. Si la imagen es casi toda borde, como una foto, la traza en Color plano con 16 colores y avisa. |
 | **Píxel exacto** | Pixel art | Detecta la rejilla y emite rectángulos fusionados, sin pérdida y con `crispEdges`. |
 
 - **Motores:** Potrace (principal) y VTracer. Si uno no se puede cargar se usa el otro y se avisa.
@@ -28,13 +29,30 @@ píxeles distintos) y muestra un mapa de diferencias.
   tolerancia de curva y manchas mínimas (primero sobre una versión reducida si la imagen es grande) y compara con VTracer. Se
   queda con el mejor equilibrio entre fidelidad, esquinas y nodos sin perder más de 0,5 puntos de fidelidad frente a los
   parámetros de partida. Al aplicarlo muestra fidelidad, esquinas, nodos y tamaño antes y después, y qué parámetros cambió.
-  Muestra el progreso y se puede cancelar.
+  Muestra el progreso y se puede cancelar. En Degradados, la segmentación y los degradados ajustados se calculan una vez y
+  sirven para todas las combinaciones.
 - **Avisos:** parece una foto, trazos finos, demasiados rectángulos, reescalado limitado, entrada grande, motor no disponible,
-  trazado vacío y transparencia falsa, cada uno con su acción sugerida.
-- **Salida:** descargar o copiar el SVG, opcionalmente optimizado con SVGO.
+  trazado vacío, transparencia falsa y degradados no reconstruidos, cada uno con su acción sugerida. Si una imagen que parece
+  foto tiene formas que se explican con degradados, el aviso ofrece **Usar degradados**.
+- **Salida:** descargar o copiar el SVG, opcionalmente optimizado con SVGO (conserva los `<defs>` y los ids de los
+  degradados).
 
-Límites: cada lado de la imagen hasta 4096 px; el reescalado interno no pasa de 16 megapíxeles. Fotos y degradados se
-posterizan (y se avisa).
+Límites: cada lado de la imagen hasta 4096 px; el reescalado interno no pasa de 16 megapíxeles. Las fotos se posterizan (y
+se avisa); los degradados de logos e ilustraciones se reconstruyen como degradados SVG en el modo Degradados.
+
+## Degradados
+
+Cada forma de la imagen (una pluma, un brillo, una sombra) sale como un único trazado con su propio relleno: color plano,
+`<linearGradient>` o `<radialGradient>`, en unidades del `viewBox` (`gradientUnits="userSpaceOnUse"`, sin
+`gradientTransform`), así que se edita en Figma, Illustrator o Inkscape como cualquier degradado. Las capas son
+**Recortadas** por defecto para que cada forma tenga su degradado; **Apiladas** también funciona.
+
+- **Detalle de regiones:** cuánto separa dos zonas de color parecido; más alto encuentra más formas.
+- **Paradas máximas:** colores por degradado, de 2 a 8. Un degradado de dos colores usa dos aunque el máximo sea mayor.
+- **Degradados radiales:** permite degradados circulares además de los lineales.
+
+Si la imagen es casi toda borde (una foto, ruido) o se divide en más de 2000 regiones, no hay degradados que reconstruir:
+se traza en Color plano con 16 colores y el aviso **Degradados no reconstruidos** lo explica.
 
 ## Transparencia falsa (tablero pintado)
 
@@ -63,7 +81,8 @@ npm run build       # genera dist/
 npm run preview     # sirve dist/ en http://localhost:4173/image2svg/
 ```
 
-En desarrollo, `?synth=circle`, `line`, `glyph`, `flat`, `sprite` o `logo` carga una imagen sintética sin necesidad de archivo.
+En desarrollo, `?synth=circle`, `line`, `glyph`, `flat`, `sprite`, `logo`, `gradient` (plumas con degradado lineal) o `radial`
+(disco con degradado radial) carga una imagen sintética sin necesidad de archivo.
 
 ### Bench con imágenes reales
 

@@ -11,6 +11,11 @@
  *        A mask that covers the whole canvas (masks[0] in stacked mode over an opaque
  *        background) is emitted as a single rectangular path instead of being traced; with a
  *        transparent background pixels with alpha < 128 belong to no layer.
+ * gradient: composite like flat -> box proxy <= 4 Mpx -> noise sigma -> edge segmentation into regions ->
+ *        one solid / linear / radial model per region, merged regions re-fitted -> resampleRaster U ->
+ *        labels refined at Ux by the models -> painter's order -> one lazy mask per region, the layer
+ *        carrying its gradient (see prepareGradient). Too many edges or regions: 16-colour flat palette
+ *        with the 'gradient-fallback' warning.
  * pixel: detectGrid (or gridScale) -> downscaleNearest -> pixelSvg at the source size (a gridScale
  *        that does not divide the image keeps its partial edge blocks, in source-pixel coordinates);
  *        above MAX_PIXEL_RECTS merged rectangles no SVG is built (svg '') and 'too-many-rects'
@@ -25,12 +30,16 @@ import type {
   BinaryMask,
   ConcreteMode,
   Engine,
+  Fill,
+  Gradient,
   GrayImage,
   Layer,
   PathStats,
   RasterImage,
+  RegionModel,
   ResolvedParams,
   RGB,
+  Segmentation,
   SourceInfo,
   TraceParams,
   TraceResult,
@@ -39,7 +48,7 @@ import type {
   Warning,
 } from '../types';
 import { alphaToGray, compositeOnColor, dominantInkColor, toGray } from './raster';
-import { MAX_UPSCALED_AREA, upscaleGray, upscaleRaster } from './upscale';
+import { MAX_UPSCALED_AREA, downscaleBoxRaster, upscaleGray, upscaleRaster } from './upscale';
 import { gaussianBlur, gaussianBlurRaster } from './blur';
 import { binarize, maskFromAlpha, resolveThreshold } from './threshold';
 import { resolveAlphaMode, resolveBackground } from './background';
@@ -49,15 +58,32 @@ import { cutoutMasks, layerOrder, nestedMasks } from './stack';
 import { MAX_PIXEL_RECTS, downscaleNearest, pixelSvg } from './pixelExact';
 import { countInk } from './morphology';
 import { detectGrid } from './edges';
-import { analyzeSource, classify, THIN_STROKE_RATIO } from './classify';
+import { analyzeSource, classify, PHOTO_FALLBACK_COLORS, THIN_STROKE_RATIO } from './classify';
 import { applyBakedBackground, detectBakedCheckerboard, effectiveSource } from './bakedBackground';
+import { immerkaerSigma } from './noise';
+import { CORE_MIN_ALPHA, MAX_GRADIENT_REGIONS, NO_REGION, mergeRegions, rankMap, refineLabels, regionMask, regionOrder, segmentEdges, segmentRegions } from './regions';
+import { accumulateMoments, corePixels, extendGradient, planMerges, rmseOf, selectModel, type RegionPixels } from './fillModel';
+import { isDegenerateGradient, scaleGradient } from './fillEval';
 import { assembleSvg } from '../svg/assemble';
+import { gradientMeanHex, rgbToHex } from '../svg/gradients';
 import { pathStats, utf8ByteLength } from '../svg/pathStats';
 
 export interface PreparedLayer {
-  mask: BinaryMask;
+  /**
+   * Pixels of the layer at Ux (1 = paint). A function builds the mask on demand: gradient mode keeps a
+   * single mask alive at a time (dozens of 16 Mpx masks at once would not fit). Read it with layerMask().
+   */
+  mask: BinaryMask | (() => BinaryMask);
+  /** '#rrggbb'; with `gradient`, the mean colour of its stops. */
   fill: string;
   opacity?: number;
+  /** Gradient mode: the gradient that paints the layer, in viewBox units (Ux). */
+  gradient?: Gradient;
+}
+
+/** The layer's mask. A lazy mask is built again on every call: keep the result if you need it twice. */
+export function layerMask(pl: PreparedLayer): BinaryMask {
+  return typeof pl.mask === 'function' ? pl.mask() : pl.mask;
 }
 
 export interface Prepared {
@@ -164,6 +190,21 @@ export function bakedCheckerboardWarning(det: BakedCheckerboard): Warning {
   };
 }
 
+/**
+ * Gradient mode could not rebuild the image with gradients and traced it as a flat palette of
+ * PHOTO_FALLBACK_COLORS colours. `reason` (Spanish, lower-case start, no final period) says why; null
+ * gives the generic sentence.
+ */
+export function gradientFallbackWarning(reason: string | null): Warning {
+  const why = reason === null ? '' : `: ${reason}`;
+  return {
+    code: 'gradient-fallback',
+    message:
+      `No se pudieron reconstruir los degradados${why}. ` +
+      `Se vectorizó como Color plano con ${PHOTO_FALLBACK_COLORS} colores y pueden verse bandas de color.`,
+  };
+}
+
 function tooManyRectsWarning(count: number): Warning {
   return {
     code: 'too-many-rects',
@@ -214,7 +255,7 @@ function isAlphaUniform(img: RasterImage): boolean {
 }
 
 /** True when every pixel of the mask is ink (a full-canvas layer). */
-function isFullMask(mask: BinaryMask): boolean {
+export function isFullMask(mask: BinaryMask): boolean {
   const d = mask.data;
   for (let i = 0; i < d.length; i++) if (d[i] === 0) return false;
   return d.length > 0;
@@ -228,7 +269,7 @@ function intersectInto(a: BinaryMask, b: BinaryMask): void {
 }
 
 /** Single closed rectangle path covering [0,w]×[0,h] in viewBox units. */
-function rectPath(w: number, h: number): AbsPath {
+export function rectPath(w: number, h: number): AbsPath {
   return {
     segs: [
       { kind: 'M', x: 0, y: 0 },
@@ -422,6 +463,425 @@ export function prepareFlat(img: RasterImage, resolved: ResolvedParams, info: So
 }
 
 // ---------------------------------------------------------------------------------------------
+// gradient
+// ---------------------------------------------------------------------------------------------
+
+/** Segmentation and model fitting run on a box-downscaled proxy of at most this many pixels. */
+export const GRADIENT_PROXY_AREA = 4e6;
+/** Above this share of edge pixels (Segmentation.edgeShare) the image is not flat art: flat fallback. */
+export const GRADIENT_MAX_EDGE_SHARE = 0.6;
+/** At most this many rounds of planMerges -> mergeRegions -> re-fit; a round without pairs ends them. */
+export const GRADIENT_MERGE_ROUNDS = 3;
+/**
+ * Deep band of a region: its opaque pixels (alpha >= CORE_MIN_ALPHA) whose Chebyshev neighbourhood of radius
+ * GRADIENT_FIT_DEPTH (clipped to the image) holds that region only, core or edge. On a steep smooth ramp the Sobel
+ * hysteresis floods the region from its outline and leaves a core that no longer spans the ramp (radialDisc(128):
+ * 1976 core pixels of 7256, fitted radius 24.9 px of 48).
+ */
+export const GRADIENT_FIT_DEPTH = 1;
+/** A region whose core pixels are fewer than this share of its core ∪ deep band is fitted again on that union. */
+export const GRADIENT_FIT_MIN_CORE_SHARE = 0.5;
+/**
+ * The union fit replaces the core fit only when it is not complex while the core fit was not, and its RMSE on the
+ * core pixels exceeds the core fit's by at most this many levels (the core stays the trusted sample).
+ */
+export const GRADIENT_FIT_CORE_TOLERANCE = 0.5;
+/**
+ * Above this share of the labelled area in complex regions (no solid, linear or radial model explains them) the image is
+ * not flat art either: flat fallback. noisePhoto(64) was caught by the edge share only while the Sobel hysteresis
+ * flooded smooth ramps; once gated, it is 44 % edge and 91 % complex (see "Decisiones de implementación").
+ */
+export const GRADIENT_MAX_COMPLEX_SHARE = 0.5;
+
+/** Proxy factor of gradient mode: f = ceil(sqrt(W·H / GRADIENT_PROXY_AREA)), at least 1. */
+export function gradientProxyFactor(width: number, height: number): number {
+  return Math.max(1, Math.ceil(Math.sqrt((width * height) / GRADIENT_PROXY_AREA)));
+}
+
+/**
+ * The part of gradient mode that does not depend on the upscale, the blur or the layering (the tuner memoises
+ * it per image): either why the image falls back to the flat palette, or its merged regions and their models.
+ */
+export type GradientFit =
+  | { kind: 'fallback'; /** Spanish, lower-case start, no final period (gradientFallbackWarning). */ reason: string }
+  | {
+      kind: 'regions';
+      /** What the layers are resampled from: the source composited on the resolved background, or the source itself when that is transparent. */
+      base: RasterImage;
+      transparent: boolean;
+      /** Proxy factor: seg and every model are in units of the proxy (1 proxy px = f px of base). */
+      f: number;
+      /** immerkaerSigma of the proxy (levels). */
+      sigma: number;
+      /** Segmentation of the proxy after the merges; its core is the fit core (core pixels and deep band). */
+      seg: Segmentation;
+      /** models[k] = the model of region k of seg. */
+      models: RegionModel[];
+      /** Regions segmentRegions gave before merging. */
+      rawRegions: number;
+      /** Merge rounds that found pairs (0..GRADIENT_MERGE_ROUNDS). */
+      mergeRounds: number;
+    };
+
+/** Deep band of every region of `seg` (see GRADIENT_FIT_DEPTH), core pixels included: 1 = in the band. */
+function deepBand(seg: Segmentation, img: RasterImage, depth: number): Uint8Array {
+  const { width: w, height: h, data: lab } = seg.regions;
+  const n = w * h;
+  const src = img.data;
+  const cap = depth + 1;
+  // hor[i]: the run of equal labels through i reaches `depth` px (or the image edge) on both sides.
+  const hor = new Uint8Array(n);
+  const left = new Uint8Array(w);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      left[x] = x > 0 && lab[i - 1] === lab[i] ? Math.min(cap, left[x - 1] + 1) : 1;
+    }
+    let right = 1;
+    for (let x = w - 1; x >= 0; x--) {
+      const i = row + x;
+      right = x < w - 1 && lab[i + 1] === lab[i] ? Math.min(cap, right + 1) : 1;
+      if (lab[i] >= 0 && left[x] - 1 >= Math.min(depth, x) && right - 1 >= Math.min(depth, w - 1 - x)) hor[i] = 1;
+    }
+  }
+  // The same along the columns, over rows whose run qualifies with the same label.
+  const up = new Uint8Array(n);
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (hor[i] === 0) continue;
+      up[i] = y > 0 && hor[i - w] !== 0 && lab[i - w] === lab[i] ? Math.min(cap, up[i - w] + 1) : 1;
+    }
+  }
+  const band = new Uint8Array(n);
+  const down = new Uint8Array(w);
+  for (let y = h - 1; y >= 0; y--) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      if (hor[i] === 0) {
+        down[x] = 0;
+        continue;
+      }
+      down[x] = y < h - 1 && hor[i + w] !== 0 && lab[i + w] === lab[i] ? Math.min(cap, down[x] + 1) : 1;
+      if (up[i] - 1 >= Math.min(depth, y) && down[x] - 1 >= Math.min(depth, h - 1 - y) && src[i * 4 + 3] >= CORE_MIN_ALPHA) {
+        band[i] = 1;
+      }
+    }
+  }
+  return band;
+}
+
+interface FittedRegions {
+  /** `seg` with core = the fit core: the core, plus the deep band of every region fitted on it. */
+  fitSeg: Segmentation;
+  px: RegionPixels;
+  models: RegionModel[];
+  /** deep[k] = 1: region k was fitted on its core ∪ deep band. */
+  deep: Uint8Array;
+}
+
+/**
+ * One model per region of `seg` (core = the segmentation's core). known[k] (a region unchanged since the previous
+ * fit) is kept as it is; every other region gets selectModel on its core pixels and, when those are fewer than
+ * GRADIENT_FIT_MIN_CORE_SHARE of its core ∪ deep band, selectModel on that union, which wins under
+ * GRADIENT_FIT_CORE_TOLERANCE (see there).
+ */
+function fitRegionModels(
+  proxy: RasterImage,
+  seg: Segmentation,
+  opts: { sigma: number; maxStops: number; radial: boolean },
+  known: ReadonlyArray<{ model: RegionModel; deep: number } | null>,
+): FittedRegions {
+  const count = seg.regions.count;
+  const reg = seg.regions.data;
+  const core = seg.core.data;
+  const band = deepBand(seg, proxy, GRADIENT_FIT_DEPTH);
+  const models: RegionModel[] = new Array<RegionModel>(count);
+  const deep = new Uint8Array(count);
+  const todo: number[] = [];
+  for (let k = 0; k < count; k++) {
+    const kn = known[k];
+    if (kn === null || kn === undefined) {
+      todo.push(k);
+    } else {
+      models[k] = kn.model;
+      deep[k] = kn.deep;
+    }
+  }
+  if (todo.length > 0) {
+    const corePx = corePixels(seg);
+    const moments = accumulateMoments(proxy, seg);
+    const unionCount = new Float64Array(count);
+    for (let i = 0; i < reg.length; i++) if (reg[i] >= 0 && (core[i] !== 0 || band[i] !== 0)) unionCount[reg[i]]++;
+    const candidate = new Uint8Array(count);
+    let candidates = 0;
+    for (const k of todo) {
+      models[k] = selectModel(proxy, corePx, k, moments, opts);
+      if (corePx.offsets[k + 1] - corePx.offsets[k] < GRADIENT_FIT_MIN_CORE_SHARE * unionCount[k]) {
+        candidate[k] = 1;
+        candidates++;
+      }
+    }
+    if (candidates > 0) {
+      const trial = Uint8Array.from(core);
+      for (let i = 0; i < reg.length; i++) if (band[i] !== 0 && reg[i] >= 0 && candidate[reg[i]] !== 0) trial[i] = 1;
+      const trialSeg: Segmentation = { ...seg, core: { data: trial, width: seg.core.width, height: seg.core.height } };
+      const trialPx = corePixels(trialSeg);
+      const trialMoments = accumulateMoments(proxy, trialSeg);
+      for (const k of todo) {
+        if (candidate[k] === 0) continue;
+        const onCore = models[k];
+        const onUnion = selectModel(proxy, trialPx, k, trialMoments, opts);
+        if ((!onUnion.complex || onCore.complex) && rmseOf(proxy, corePx, k, onUnion.fill) <= onCore.rmse + GRADIENT_FIT_CORE_TOLERANCE) {
+          models[k] = onUnion;
+          deep[k] = 1;
+        }
+      }
+    }
+  }
+  let fitCore = seg.core;
+  if (deep.some((v) => v !== 0)) {
+    const data = Uint8Array.from(core);
+    for (let i = 0; i < reg.length; i++) if (band[i] !== 0 && reg[i] >= 0 && deep[reg[i]] !== 0) data[i] = 1;
+    fitCore = { data, width: seg.core.width, height: seg.core.height };
+  }
+  const fitSeg: Segmentation = { ...seg, core: fitCore };
+  return { fitSeg, px: corePixels(fitSeg), models, deep };
+}
+
+/**
+ * Segments and fits gradient mode on `img` (the traced source): background as flat (resolveBackground; transparent
+ * -> not composited) -> proxy (downscaleBoxRaster by gradientProxyFactor, on premultiplied colour when transparent)
+ * -> sigma = immerkaerSigma(proxy) -> segmentEdges; fallback when edgeShare > GRADIENT_MAX_EDGE_SHARE, before any
+ * labelling -> segmentRegions(proxy, { regionDetail, sigma, edges }); fallback with more than MAX_GRADIENT_REGIONS
+ * regions. Otherwise selectModel per region (maxStops,
+ * radial = radialGradients) on its core, or on its core ∪ deep band when the core no longer spans it
+ * (GRADIENT_FIT_MIN_CORE_SHARE), and up to GRADIENT_MERGE_ROUNDS rounds of planMerges -> mergeRegions, re-fitting
+ * every region made of more than one old region (the others keep their model). splitComplex does not exist yet: a
+ * complex region keeps the lowest-RMSE candidate selectModel returns; above GRADIENT_MAX_COMPLEX_SHARE of the labelled
+ * area in complex regions, fallback. Last, every gradient is extended over its region's deep band (extendModels).
+ */
+export function fitGradientRegions(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): GradientFit {
+  assertImage(img, 'fitGradientRegions');
+  const bg = resolveBackground(img, resolved.background, info);
+  const transparent = bg === null;
+  const base = transparent ? img : compositeOnColor(img, bg);
+  const f = gradientProxyFactor(img.width, img.height);
+  const proxy =
+    f === 1 ? base : transparent ? unpremultiply(downscaleBoxRaster(premultiply(base), f)) : downscaleBoxRaster(base, f);
+  const sigma = immerkaerSigma(proxy);
+  // The edge share is known before any labelling: an image that falls back on it is not segmented further.
+  const edges = segmentEdges(proxy, { regionDetail: resolved.regionDetail, sigma });
+  if (edges.edgeShare > GRADIENT_MAX_EDGE_SHARE) {
+    return { kind: 'fallback', reason: `el ${pct(edges.edgeShare)} % de la imagen es borde` };
+  }
+  let seg = segmentRegions(proxy, { regionDetail: resolved.regionDetail, sigma, edges });
+  const rawRegions = seg.regions.count;
+  if (rawRegions > MAX_GRADIENT_REGIONS) {
+    return {
+      kind: 'fallback',
+      reason: `la imagen se divide en ${formatCount(rawRegions)} regiones (el límite es ${formatCount(MAX_GRADIENT_REGIONS)})`,
+    };
+  }
+
+  const fitOpts = { sigma, maxStops: resolved.maxStops, radial: resolved.radialGradients };
+  let fitted = fitRegionModels(proxy, seg, fitOpts, new Array<null>(seg.regions.count).fill(null));
+  // Complex regions do not become explained by merging: over the limit already, fall back without the merge rounds.
+  const early = complexFallback(seg.area, fitted.models);
+  if (early !== null) return early;
+  let mergeRounds = 0;
+  for (let round = 0; round < GRADIENT_MERGE_ROUNDS; round++) {
+    const pairs = planMerges(proxy, fitted.fitSeg, fitted.models, {
+      sigma,
+      pixels: fitted.px,
+      maxStops: resolved.maxStops,
+      radial: resolved.radialGradients,
+    });
+    if (pairs.length === 0) break;
+    mergeRounds++;
+    const { seg: merged, remap } = mergeRegions(seg, pairs);
+    const members = new Int32Array(merged.regions.count);
+    const member = new Int32Array(merged.regions.count);
+    for (let old = 0; old < remap.length; old++) {
+      members[remap[old]]++;
+      member[remap[old]] = old;
+    }
+    const known: Array<{ model: RegionModel; deep: number } | null> = [];
+    for (let k = 0; k < merged.regions.count; k++) {
+      known.push(members[k] === 1 ? { model: fitted.models[member[k]], deep: fitted.deep[member[k]] } : null);
+    }
+    seg = merged;
+    fitted = fitRegionModels(proxy, seg, fitOpts, known);
+  }
+  const models = fitted.models;
+  seg = fitted.fitSeg;
+  const late = complexFallback(seg.area, models);
+  if (late !== null) return late;
+  extendModels(proxy, seg, models, fitted.px);
+  return { kind: 'regions', base, transparent, f, sigma, seg, models, rawRegions, mergeRounds };
+}
+
+/** The complex-share fallback: above GRADIENT_MAX_COMPLEX_SHARE of the labelled area in complex regions, null otherwise. */
+function complexFallback(area: Float64Array, models: readonly RegionModel[]): GradientFit | null {
+  let labelled = 0;
+  let complexArea = 0;
+  for (let k = 0; k < models.length; k++) {
+    labelled += area[k];
+    if (models[k].complex) complexArea += area[k];
+  }
+  if (!(labelled > 0) || complexArea / labelled <= GRADIENT_MAX_COMPLEX_SHARE) return null;
+  return { kind: 'fallback', reason: `el ${pct(complexArea / labelled)} % de la imagen no se explica con colores planos ni degradados` };
+}
+
+/**
+ * In place on `models`: every gradient is extended over the deep band of its region (GRADIENT_FIT_DEPTH) with
+ * extendGradient, so its stop range reaches the outline instead of ending where the core ends; rmse is recomputed on
+ * the fit core.
+ */
+function extendModels(proxy: RasterImage, seg: Segmentation, models: RegionModel[], px: RegionPixels): void {
+  const count = models.length;
+  if (!models.some((m) => m.fill.kind !== 'solid')) return;
+  const band = deepBand(seg, proxy, GRADIENT_FIT_DEPTH);
+  const reg = seg.regions.data;
+  const offsets = new Int32Array(count + 1);
+  for (let i = 0; i < reg.length; i++) if (band[i] !== 0 && reg[i] >= 0 && models[reg[i]].fill.kind !== 'solid') offsets[reg[i] + 1]++;
+  for (let k = 0; k < count; k++) offsets[k + 1] += offsets[k];
+  const cursor = offsets.slice(0, count);
+  const indices = new Int32Array(offsets[count]);
+  for (let i = 0; i < reg.length; i++) {
+    if (band[i] !== 0 && reg[i] >= 0 && models[reg[i]].fill.kind !== 'solid') indices[cursor[reg[i]]++] = i;
+  }
+  for (let k = 0; k < count; k++) {
+    const fill = models[k].fill;
+    if (fill.kind === 'solid') continue;
+    const extended = extendGradient(proxy, fill, indices.subarray(offsets[k], offsets[k + 1]));
+    if (extended !== fill) models[k] = { ...models[k], fill: extended, rmse: rmseOf(proxy, px, k, extended) };
+  }
+}
+
+/**
+ * Gradient mode ('Degradados'): one layer per region, each painted with a solid, linear or radial fill
+ * (contract in ARCHITECTURE.md, "src/core/pipeline.ts"). `fit` defaults to fitGradientRegions(img, resolved, info).
+ * Fallback: prepareFlat with a PHOTO_FALLBACK_COLORS-colour median-cut palette (exactPalette false; the resolved
+ * layering) plus gradientFallbackWarning(reason). Otherwise: up = resampleRaster(base, U, sigmaPx, transparent) ->
+ * refineLabels(seg, fills in proxy units, up, U·f) -> regionOrder -> rankMap, and in that order one layer per region
+ * with Ux pixels: mask () => regionMask(ranks, W·U, H·U, j, layering, cutout ? ceil(U/2) : 0) (built on every read);
+ * fill = the hex of the solid colour or of the gradient's mean colour; gradient = scaleGradient(g, U·f). A pixel of
+ * up with alpha < 128 has no region (refineLabels), and regionMask never paints such a pixel, so every mask is
+ * already inside the alpha mask of up. A full mask (stacked layer 0 over an opaque background) becomes the canvas
+ * rectangle in traceLayers.
+ */
+export function prepareGradient(
+  img: RasterImage,
+  resolved: ResolvedParams,
+  info: SourceInfo,
+  fit: GradientFit = fitGradientRegions(img, resolved, info),
+): Prepared {
+  assertImage(img, 'prepareGradient');
+  const { width, height } = img;
+  if (fit.kind === 'fallback') {
+    const flat = prepareFlat(img, { ...resolved, mode: 'flat', colors: PHOTO_FALLBACK_COLORS, exactPalette: false }, info);
+    return { ...flat, warnings: [...flat.warnings, gradientFallbackWarning(fit.reason)] };
+  }
+  const U = resolved.upscale;
+  const warnings = baseWarnings(resolved, width, height);
+  const { seg, models, f } = fit;
+  const up = resampleRaster(fit.base, U, resolved.sigmaPx, fit.transparent);
+  const WU = up.width;
+  const HU = up.height;
+  const fills = models.map((m) => m.fill);
+  let ranks = refineLabels(seg, fills, up, U * f);
+  if (f > 1 && refitThinFills(seg, fills, ranks, up)) ranks = refineLabels(seg, fills, up, U * f);
+  const order = regionOrder(seg);
+  rankMap(ranks, order);
+  const pixels = new Float64Array(order.length);
+  for (let i = 0; i < ranks.length; i++) {
+    const r = ranks[i];
+    if (r !== NO_REGION) pixels[r]++;
+  }
+
+  const layering = resolved.layering;
+  const dilate = layering === 'cutout' ? Math.ceil(U / 2) : 0;
+  const layers: PreparedLayer[] = [];
+  for (let j = 0; j < order.length; j++) {
+    if (pixels[j] === 0) continue;
+    const fill = fills[order[j]];
+    const layer: PreparedLayer = {
+      mask: () => regionMask(ranks, WU, HU, j, layering, dilate),
+      fill: fill.kind === 'solid' ? rgbToHex(fill.color) : gradientMeanHex(fill),
+    };
+    if (fill.kind !== 'solid' && !isDegenerateGradient(fill)) layer.gradient = scaleGradient(fill, U * f);
+    layers.push(layer);
+  }
+  return { U, width, height, layers, warnings };
+}
+
+/**
+ * On a proxy (f > 1) a region with no pixel whose 3×3 (in the image) is all its own is a stroke at most 2 px wide there,
+ * averaged with its surroundings by the box downscale (the 1-px black frame of pajaro fitted as #7f7f7f..#a9a9a9). In
+ * place on `fills`: each such region gets the mean colour, solid, of the pixels of `up` that `labels` (refineLabels,
+ * before rankMap) gave it, i.e. of the full-resolution pixels closer to it than to its neighbours. Returns whether
+ * any fill changed (the caller labels `up` again with the new colours).
+ */
+function refitThinFills(seg: Segmentation, fills: Fill[], labels: Uint16Array, up: RasterImage): boolean {
+  const { width: w, height: h, data: lab, count } = seg.regions;
+  const interior = new Uint8Array(count);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const k = lab[y * w + x];
+      if (k < 0 || interior[k] !== 0) continue;
+      let all = true;
+      for (let yy = Math.max(0, y - 1); yy <= Math.min(h - 1, y + 1) && all; yy++) {
+        for (let xx = Math.max(0, x - 1); xx <= Math.min(w - 1, x + 1); xx++) {
+          if (lab[yy * w + xx] !== k) {
+            all = false;
+            break;
+          }
+        }
+      }
+      if (all) interior[k] = 1;
+    }
+  }
+  if (interior.every((v) => v !== 0)) return false;
+  const sums = new Float64Array(count * 4);
+  const d = up.data;
+  for (let i = 0; i < labels.length; i++) {
+    const k = labels[i];
+    if (k === NO_REGION || interior[k] !== 0) continue;
+    const o = i * 4;
+    sums[k * 4] += d[o];
+    sums[k * 4 + 1] += d[o + 1];
+    sums[k * 4 + 2] += d[o + 2];
+    sums[k * 4 + 3]++;
+  }
+  let changed = false;
+  for (let k = 0; k < count; k++) {
+    const n = sums[k * 4 + 3];
+    if (interior[k] !== 0 || n === 0) continue;
+    fills[k] = { kind: 'solid', color: [sums[k * 4] / n, sums[k * 4 + 1] / n, sums[k * 4 + 2] / n] };
+    changed = true;
+  }
+  return changed;
+}
+
+/** The preparation of `resolved.mode`: lines, flat or gradient layers (pixel mode has none and throws). */
+export function prepareForMode(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): Prepared {
+  switch (resolved.mode) {
+    case 'lines':
+      return prepareLines(img, resolved, info);
+    case 'flat':
+      return prepareFlat(img, resolved, info);
+    case 'gradient':
+      return prepareGradient(img, resolved, info);
+    case 'pixel':
+      throw new Error('pipeline: el modo píxel no prepara capas');
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // pixel
 // ---------------------------------------------------------------------------------------------
 
@@ -518,16 +978,23 @@ function tracerOptions(resolved: ResolvedParams): TracerOptions {
   };
 }
 
-async function traceLayers(prepared: Prepared, tracer: Tracer, opts: TracerOptions): Promise<Layer[]> {
+/**
+ * Traces the prepared layers back to front: one Layer per PreparedLayer whose trace is not empty. A
+ * full-canvas mask becomes rectPath(W·U, H·U) without tracing; opacity (< 1) and gradient are copied.
+ * Lazy masks are built one at a time. Shared by trace() and the tuner, so both emit the same layers.
+ */
+export async function traceLayers(prepared: Prepared, tracer: Tracer, opts: TracerOptions): Promise<Layer[]> {
   const vw = prepared.width * prepared.U;
   const vh = prepared.height * prepared.U;
   const layers: Layer[] = [];
   for (let i = 0; i < prepared.layers.length; i++) {
     const pl = prepared.layers[i];
-    const paths: AbsPath[] = isFullMask(pl.mask) ? [rectPath(vw, vh)] : await tracer.traceBinary(pl.mask, opts);
+    const mask = layerMask(pl);
+    const paths: AbsPath[] = isFullMask(mask) ? [rectPath(vw, vh)] : await tracer.traceBinary(mask, opts);
     if (paths.length === 0) continue;
     const layer: Layer = { fill: pl.fill, paths };
     if (pl.opacity !== undefined && pl.opacity < 1) layer.opacity = pl.opacity;
+    if (pl.gradient !== undefined) layer.gradient = pl.gradient;
     layers.push(layer);
   }
   return layers;
@@ -606,7 +1073,7 @@ export async function trace(
     const si = sourceInfo();
     baked = si.bakedBackground ?? null;
     const source = effectiveSource(img, si, resolved);
-    const prepared = resolved.mode === 'lines' ? prepareLines(source, resolved, si) : prepareFlat(source, resolved, si);
+    const prepared = prepareForMode(source, resolved, si);
     const layers = await traceLayers(prepared, picked.tracer, tracerOptions(resolved));
     svg = assembleSvg(layers, {
       width: prepared.width,
@@ -621,7 +1088,7 @@ export async function trace(
     if (
       layers.length === 0 &&
       !warnings.some((x) => x.code === 'empty-trace') &&
-      prepared.layers.some((l) => countInk(l.mask) > 0)
+      prepared.layers.some((l) => countInk(layerMask(l)) > 0)
     ) {
       warnings.push(emptyTraceWarning('tracer'));
     }

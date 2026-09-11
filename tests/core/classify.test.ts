@@ -1,17 +1,38 @@
 import { describe, expect, it } from 'vitest';
-import type { RasterImage, SourceInfo } from '../../src/types';
-import { analyzeSource, classify, offPaletteShare } from '../../src/core/classify';
+import type { GradientProbe, RasterImage, RGB, SourceInfo } from '../../src/types';
+import {
+  GRADIENT_FLAT_MIN_GRADIENT_SHARE,
+  GRADIENT_MAX_COMPLEX_SHARE,
+  GRADIENT_MAX_EDGE_SHARE,
+  GRADIENT_MAX_REGIONS,
+  GRADIENT_MIN_EXPLAINED,
+  GRADIENT_PROBE_MIN_COLORS,
+  GRADIENT_SUGGEST_EXPLAINED,
+  PHOTO_OFF_PALETTE_RATIO,
+  analyzeSource,
+  classify,
+  gradientProbeFactor,
+  offPaletteShare,
+  probeGradients,
+} from '../../src/core/classify';
+import { GRADIENT_MAX_COMPLEX_SHARE as PIPELINE_MAX_COMPLEX_SHARE, GRADIENT_MAX_EDGE_SHARE as PIPELINE_MAX_EDGE_SHARE } from '../../src/core/pipeline';
+import { segmentRegions } from '../../src/core/regions';
 import {
   aaCircle,
   aaDiagonalLine,
   coverage,
+  diagonalSweep,
   flatShapes3,
   glyph,
+  gradientFeathers,
   grayToRaster,
   nearestUpscale,
   bakedCheckerLogo,
   noisePhoto,
+  radialDisc,
   sprite32,
+  transparentLogo,
+  withNoise,
 } from '../../src/dev/synth';
 import { accentIcon, ringedDisc } from '../fixtures/shapes';
 
@@ -113,6 +134,7 @@ function baseInfo(over: Partial<SourceInfo>): SourceInfo {
     borderColor: [255, 255, 255],
     isBimodal: false,
     bakedBackground: null,
+    gradientProbe: null,
     ...over,
   };
 }
@@ -120,6 +142,13 @@ function baseInfo(over: Partial<SourceInfo>): SourceInfo {
 const SPANISH = /[áéíóúñ]|(^| )(de|la|el|se|con|colores|imagen|trazos)( |$)/i;
 
 describe('analyzeSource', () => {
+  it('leaves the gradient probe null on the flat branch with fewer than GRADIENT_PROBE_MIN_COLORS exact colours', () => {
+    const info = analyzeSource(flatShapes3().image);
+    expect(info.paletteColors).toBeLessThan(GRADIENT_PROBE_MIN_COLORS);
+    expect(offPaletteShare(info)).toBeLessThanOrEqual(PHOTO_OFF_PALETTE_RATIO);
+    expect(info.gradientProbe).toBeNull();
+  });
+
   it('flatShapes3: 3..32 colours, no alpha, border = background colour, dominant ink = rect, not bimodal', () => {
     const info = analyzeSource(flatShapes3().image);
     expect(info.width).toBe(96);
@@ -439,5 +468,231 @@ describe('classify: transparent sources and fake transparency', () => {
     expect(kept.transparentRatio).toBe(0);
     expect(kept.paletteColors).toBeGreaterThanOrEqual(3);
     expect(classify(kept).mode).toBe('flat');
+  });
+});
+
+const WHITE: RGB = [255, 255, 255];
+
+/** pajaro's probe (bench, 2026-09-11): 39 regions, 98.8 % explained, 9.6 % of the labelled area linear. */
+function probe(over: Partial<GradientProbe> = {}): GradientProbe {
+  return { sigma: 0.018, regions: 39, explained: 0.988, linearShare: 0.096, radialShare: 0, edgeShare: 0.09, ...over };
+}
+
+describe('probeGradients (gradient-mode probe)', () => {
+  it('proxy factor: a longer side up to 512 px is probed as it is', () => {
+    expect(gradientProbeFactor(512, 512)).toBe(1);
+    expect(gradientProbeFactor(513, 100)).toBe(2);
+    expect(gradientProbeFactor(100, 1024)).toBe(2);
+    expect(gradientProbeFactor(1025, 10)).toBe(3);
+    expect(gradientProbeFactor(4001, 4001)).toBe(8);
+    expect(gradientProbeFactor(3840, 2160)).toBe(8);
+    expect(gradientProbeFactor(0, 0)).toBe(1);
+  });
+
+  it('gradientFeathers(256): 8 linear feathers, a shadow and the background, fully explained', () => {
+    const p = probeGradients(gradientFeathers(256).image, WHITE);
+    // Measured: edgeShare 0.119, 11 regions after one merge round, explained 1, linearShare 0.110 (8 feathers of 774-967 px).
+    expect(p.sigma).toBeLessThan(0.05);
+    expect(p.edgeShare).toBeGreaterThan(0.11);
+    expect(p.edgeShare).toBeLessThan(0.13);
+    expect(p.regions).toBeGreaterThanOrEqual(10);
+    expect(p.regions).toBeLessThanOrEqual(12);
+    expect(p.explained).toBeGreaterThan(0.99);
+    expect(p.linearShare).toBeGreaterThan(0.1);
+    expect(p.linearShare).toBeLessThan(0.12);
+    expect(p.radialShare).toBe(0);
+  });
+
+  it('radialDisc: one radial disc (44 % of the image) on white; diagonalSweep: one linear rounded square (54 %)', () => {
+    // Disc r 48 on 128²: π·48² / 128² = 0.442; square of side 96 with corner radius 20: (96² − (4 − π)·20²) / 128² = 0.542.
+    const r = probeGradients(radialDisc(128).image, WHITE);
+    expect(r.regions).toBe(2);
+    expect(r.explained).toBeGreaterThan(0.99);
+    expect(r.radialShare).toBeGreaterThan(0.43);
+    expect(r.radialShare).toBeLessThan(0.46);
+    expect(r.linearShare).toBe(0);
+    const d = probeGradients(diagonalSweep(128).image, WHITE);
+    expect(d.regions).toBe(2);
+    expect(d.explained).toBeGreaterThan(0.99);
+    expect(d.linearShare).toBeGreaterThan(0.53);
+    expect(d.linearShare).toBeLessThan(0.56);
+    expect(d.radialShare).toBe(0);
+  });
+
+  it('flatShapes3: three solid regions, fully explained, no false gradient', () => {
+    const p = probeGradients(flatShapes3().image);
+    expect(p.regions).toBe(3);
+    expect(p.explained).toBe(1);
+    expect(p.linearShare).toBe(0);
+    expect(p.radialShare).toBe(0);
+  });
+
+  it('noisePhoto: under the edge limit since the Sobel gate (0.44), but mostly complex (where gradient mode falls back), so nothing is explained', () => {
+    const p = probeGradients(noisePhoto(), WHITE);
+    expect(p.edgeShare).toBeLessThan(GRADIENT_MAX_EDGE_SHARE);
+    expect(p.regions).toBeGreaterThan(0);
+    expect(p.explained).toBe(0);
+    expect(p.linearShare).toBe(0);
+    expect(p.radialShare).toBe(0);
+  });
+
+  it('pixels the segmentation hands to a neighbour count as unexplained: 3×3 dots absorbed by the background (1 - 1089/16384)', () => {
+    const size = 128;
+    const data = new Uint8ClampedArray(size * size * 4).fill(255);
+    let dots = 0;
+    for (let y = 0; y < size; y++) {
+      for (let x = 0; x < size; x++) {
+        if (x % 12 >= 4 && x % 12 < 7 && y % 12 >= 4 && y % 12 < 7) {
+          const o = (y * size + x) * 4;
+          data[o] = data[o + 1] = data[o + 2] = 20;
+          dots++;
+        }
+      }
+    }
+    const image: RasterImage = { data, width: size, height: size };
+    expect(dots).toBe(1089);
+    // The dots are under ORPHAN_MIN_AREA: one region, painted white with rmse 0 on its core.
+    expect(segmentRegions(image, { regionDetail: 1 }).regions.count).toBe(1);
+    const p = probeGradients(image, WHITE);
+    expect(p.regions).toBe(1);
+    expect(p.explained).toBeCloseTo(1 - 1089 / (size * size), 6); // 1 before the foreign-pixel test
+  });
+
+  it('a large image is probed on its box proxy: nearest x8 of radialDisc (f = 2) probes like nearest x4', () => {
+    const img = radialDisc(128).image;
+    const big = nearestUpscale(img, 8);
+    expect(gradientProbeFactor(big.width, big.height)).toBe(2);
+    expect(probeGradients(big, WHITE)).toEqual(probeGradients(nearestUpscale(img, 4), WHITE));
+  });
+
+  it('background: omitted resolves like the pipeline (border colour, or transparent above 5 %); the input is not mutated', () => {
+    const disc = radialDisc(128).image;
+    const copy = Uint8ClampedArray.from(disc.data);
+    expect(probeGradients(disc)).toEqual(probeGradients(disc, WHITE));
+    expect(Array.from(disc.data)).toEqual(Array.from(copy));
+    const logo = transparentLogo().image;
+    const p = probeGradients(logo);
+    expect(p).toEqual(probeGradients(logo, null));
+    expect(p.regions).toBe(1);
+    expect(p.explained).toBe(1);
+    expect(probeGradients({ data: new Uint8ClampedArray(0), width: 0, height: 0 })).toEqual({
+      sigma: 0,
+      regions: 0,
+      explained: 0,
+      linearShare: 0,
+      radialShare: 0,
+      edgeShare: 0,
+    });
+  });
+});
+
+describe('analyzeSource: when the gradient probe runs', () => {
+  it('on the photo branch (noisePhoto) and on exact palettes of >= GRADIENT_PROBE_MIN_COLORS colours (radialDisc), as probeGradients', () => {
+    const np = noisePhoto();
+    const npInfo = analyzeSource(np);
+    expect(npInfo.paletteColors).toBeNull();
+    expect(npInfo.gradientProbe).toEqual(probeGradients(np, npInfo.borderColor ?? WHITE));
+    const disc = radialDisc(128).image;
+    const info = analyzeSource(disc);
+    expect(info.paletteColors).toBeGreaterThanOrEqual(GRADIENT_PROBE_MIN_COLORS);
+    expect(offPaletteShare(info)).toBeLessThanOrEqual(PHOTO_OFF_PALETTE_RATIO);
+    expect(info.gradientProbe).toEqual(probeGradients(disc, WHITE));
+  });
+
+  it("the probe's complex-share limit is the pipeline's fallback limit", () => {
+    expect(GRADIENT_MAX_COMPLEX_SHARE).toBe(PIPELINE_MAX_COMPLEX_SHARE);
+  });
+
+  it("the probe's edge limit is the pipeline's fallback limit", () => {
+    expect(GRADIENT_MAX_EDGE_SHARE).toBe(PIPELINE_MAX_EDGE_SHARE);
+  });
+});
+
+describe('classify: gradient mode', () => {
+  it('gradientFeathers(256) (clean and ±3), radialDisc and diagonalSweep -> gradient, no warning, Spanish reason', () => {
+    for (const [name, img] of [
+      ['gradientFeathers', gradientFeathers(256).image],
+      ['gradientFeathers ±3', withNoise(gradientFeathers(256).image, 3, 1)],
+      ['radialDisc', radialDisc(128).image],
+      ['diagonalSweep', diagonalSweep(128).image],
+    ] as const) {
+      const r = classify(analyzeSource(img));
+      expect(r.mode, name).toBe('gradient');
+      expect(r.params, name).toEqual({ mode: 'gradient' });
+      expect(r.warnings, name).toEqual([]);
+      expect(r.reasons[0], name).toMatch(/^El \d+ % de los píxeles se explica con \d+ regi(ón|ones) de color plano o degradado/);
+      expect(r.reasons.join(' '), name).toMatch(SPANISH);
+    }
+  });
+
+  it('noisePhoto stays photo without the gradient suggestion; flatShapes3 stays flat', () => {
+    const np = classify(analyzeSource(noisePhoto()));
+    expect(np.mode).toBe('flat');
+    expect(np.warnings.map((w) => w.code)).toEqual(['photo']);
+    expect(np.warnings[0].message).not.toContain('Degradados');
+    const flat = classify(analyzeSource(flatShapes3().image));
+    expect(flat.mode).toBe('flat');
+    expect(flat.params.colors).toBe('auto');
+  });
+
+  it('rule boundaries on the photo branch (no exact palette): edgeShare, regions and explained are inclusive', () => {
+    const photoInfo = (over: Partial<GradientProbe>): SourceInfo =>
+      baseInfo({ paletteColors: null, distinctColors: 800, gradientProbe: probe(over) });
+    const isGradient = (over: Partial<GradientProbe>): boolean => classify(photoInfo(over)).mode === 'gradient';
+    expect(isGradient({})).toBe(true);
+    expect(isGradient({ edgeShare: GRADIENT_MAX_EDGE_SHARE })).toBe(true);
+    expect(isGradient({ edgeShare: GRADIENT_MAX_EDGE_SHARE + 0.001 })).toBe(false);
+    expect(isGradient({ regions: GRADIENT_MAX_REGIONS })).toBe(true);
+    expect(isGradient({ regions: GRADIENT_MAX_REGIONS + 1 })).toBe(false);
+    expect(isGradient({ explained: GRADIENT_MIN_EXPLAINED })).toBe(true);
+    expect(isGradient({ explained: GRADIENT_MIN_EXPLAINED - 0.001 })).toBe(false);
+    // Regions explained by solid colours alone are enough off the flat branch: the exact palette failed there.
+    expect(isGradient({ linearShare: 0, radialShare: 0 })).toBe(true);
+    const failed = classify(photoInfo({ explained: 0.3 }));
+    expect(failed.mode).toBe('flat');
+    expect(failed.params.colors).toBe(16);
+    expect(failed.warnings.map((w) => w.code)).toEqual(['photo']);
+    // Without a probe the photo rule is unchanged.
+    expect(classify(baseInfo({ paletteColors: null, distinctColors: 800 })).warnings.map((w) => w.code)).toEqual(['photo']);
+  });
+
+  it('on the flat branch (the exact palette covers the image) gradient mode also needs gradients', () => {
+    const flatInfo = (over: Partial<GradientProbe>): SourceInfo =>
+      baseInfo({ paletteColors: 19, offPaletteRatio: 0.015, gradientProbe: probe(over) });
+    const pajaro = classify(flatInfo({}));
+    expect(pajaro.mode).toBe('gradient');
+    expect(pajaro.warnings).toEqual([]);
+    expect(pajaro.reasons.join(' ')).toContain('Sus 19 colores planos');
+    expect(classify(flatInfo({ linearShare: GRADIENT_FLAT_MIN_GRADIENT_SHARE })).mode).toBe('gradient');
+    expect(classify(flatInfo({ linearShare: 0, radialShare: GRADIENT_FLAT_MIN_GRADIENT_SHARE })).mode).toBe('gradient');
+    const solids = classify(flatInfo({ linearShare: GRADIENT_FLAT_MIN_GRADIENT_SHARE - 0.001, radialShare: 0 }));
+    expect(solids.mode).toBe('flat');
+    expect(solids.params.colors).toBe('auto');
+    expect(solids.warnings).toEqual([]);
+    const unexplained = classify(flatInfo({ explained: GRADIENT_MIN_EXPLAINED - 0.001 }));
+    expect(unexplained.mode).toBe('flat');
+    expect(unexplained.warnings).toEqual([]);
+  });
+
+  it('the photo warning suggests gradient mode from GRADIENT_SUGGEST_EXPLAINED of explained area', () => {
+    const photoWith = (p: GradientProbe | null): string => {
+      const r = classify(baseInfo({ paletteColors: null, distinctColors: 800, gradientProbe: p }));
+      expect(r.mode).toBe('flat');
+      expect(r.warnings.map((w) => w.code)).toEqual(['photo']);
+      return r.warnings[0].message;
+    };
+    expect(photoWith(probe({ explained: GRADIENT_SUGGEST_EXPLAINED, regions: 1000 }))).toMatch(/Prueba el modo Degradados\.$/);
+    expect(photoWith(probe({ explained: GRADIENT_SUGGEST_EXPLAINED - 0.001, regions: 1000 }))).not.toContain('Degradados');
+    expect(photoWith(null)).not.toContain('Degradados');
+  });
+
+  it('the gradient reason: singular region count and the gradient share only when there are gradients', () => {
+    const one = classify(baseInfo({ paletteColors: null, gradientProbe: probe({ regions: 1, explained: 1, linearShare: 1 }) }));
+    expect(one.reasons[0]).toBe(
+      'El 100 % de los píxeles se explica con 1 región de color plano o degradado (el 100 % con degradados): se vectoriza en modo Degradados.',
+    );
+    const solids = classify(baseInfo({ paletteColors: null, gradientProbe: probe({ linearShare: 0, radialShare: 0 }) }));
+    expect(solids.reasons[0]).toBe('El 99 % de los píxeles se explica con 39 regiones de color plano o degradado: se vectoriza en modo Degradados.');
+    expect(solids.reasons.join(' ')).not.toContain('colores planos cubren');
   });
 });

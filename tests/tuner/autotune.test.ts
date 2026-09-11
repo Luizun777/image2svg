@@ -16,10 +16,19 @@ import type { BinaryMask, Engine, RasterImage, Tracer, TraceParams } from '../..
 import type { TuneProgress } from '../../src/workers/protocol';
 import { analyzeSource } from '../../src/core/classify';
 import { resolveParams } from '../../src/core/params';
-import { prepareLines, trace } from '../../src/core/pipeline';
+import { layerMask, prepareLines, trace } from '../../src/core/pipeline';
 import { computeMetrics, tunerScore } from '../../src/metrics/fidelity';
 import { effectiveSource } from '../../src/core/bakedBackground';
-import { aaCircle, bakedCheckerLogo, flatShapes3, glyph, nearestUpscale, sprite32, transparentLogo } from '../../src/dev/synth';
+import {
+  aaCircle,
+  bakedCheckerLogo,
+  flatShapes3,
+  glyph,
+  gradientFeathers,
+  nearestUpscale,
+  sprite32,
+  transparentLogo,
+} from '../../src/dev/synth';
 import { createPotraceTracer } from '../../src/tracers/potrace';
 import { createVtracerTracer } from '../../src/tracers/vtracer';
 import {
@@ -156,7 +165,7 @@ async function independentLinesScore(img: RasterImage, params: TraceParams): Pro
   const bg = metricBackground(info);
   const m = computeMetrics({ original: img, rendered: renderAt1x(parseSvg(r.svg), bg), mode: 'lines', background: bg });
   const at1x = resolveParams({ ...params, upscale: 1, blurK: 0 }, img, 'lines');
-  return tunerScore(m, r.stats, maskPerimeter(prepareLines(img, at1x, info).layers[0].mask));
+  return tunerScore(m, r.stats, maskPerimeter(layerMask(prepareLines(img, at1x, info).layers[0])));
 }
 
 function progressSignature(r: Run): string[] {
@@ -359,6 +368,30 @@ describe('autotune over a painted checkerboard', () => {
   });
 });
 
+describe('autotune in gradient mode with maxStops 4', () => {
+  // tests/pipeline/gradientRoundTrip.test.ts covers the defaults (maxStops 8); here a non-default fit parameter
+  // must survive every candidate, since the tuner memoises the segmentation keyed by it (gradientFitKey).
+  // Measured 2026-09-11: score 0.9669 -> 0.9770, fidelity 0.9877 -> 0.9850, 71 evaluated, complete, ~1.35 s; the
+  // same as with maxStops 8, because the feathers are 2-stop ramps (5 gradients of 2 stops at 128 px with 8 and
+  // with 4). So the stop-count check is a guard; reproducibility with maxStops 4 carried through is the point.
+  it('keeps maxStops 4 through the search: reproducible, never below the baseline, at most 4 stops per gradient', async () => {
+    const { image } = gradientFeathers(128, 1);
+    const params: TraceParams = { mode: 'gradient', maxStops: 4 };
+    const r = await run(image, params);
+    const res = done(r);
+    expect(res.resolved.mode).toBe('gradient');
+    expect(res.resolved.maxStops).toBe(4);
+    expect(res.params.maxStops).toBe(4);
+    expect(res.score).toBeGreaterThanOrEqual(res.defaultScore);
+    expectMonotonicProgress(r);
+    await expectReproducible(image, res);
+    await expectSummaries(image, params, res);
+    const gradients = parseSvg(res.svg).layers.flatMap((l) => (l.gradient === undefined ? [] : [l.gradient]));
+    expect(gradients.length).toBeGreaterThan(0);
+    for (const g of gradients) expect(g.stops.length).toBeLessThanOrEqual(4);
+  }, 120_000);
+});
+
 describe('autotune engines and pixel mode', () => {
   it('without vtracer there is no engine pass; without potrace the search runs on vtracer', async () => {
     const { image } = glyph();
@@ -447,6 +480,9 @@ describe('autotune helpers', () => {
     expect(comparisonBackground(image, info, 'flat', 'auto')).toEqual([1, 2, 3]);
     expect(comparisonBackground(image, info, 'flat')).toEqual([1, 2, 3]);
     expect(comparisonBackground(image, info, 'flat', 'transparent')).toEqual([1, 2, 3]);
+    // A gradient SVG paints its background region like a flat one.
+    expect(comparisonBackground(image, info, 'gradient', { rgb: [200, 10, 10] })).toEqual([200, 10, 10]);
+    expect(comparisonBackground(image, info, 'gradient', 'auto')).toEqual([1, 2, 3]);
     // lines and pixel SVGs never paint a background.
     expect(comparisonBackground(image, info, 'lines', { rgb: [200, 10, 10] })).toEqual([1, 2, 3]);
     expect(comparisonBackground(image, { borderColor: null }, 'pixel', 'white')).toEqual([255, 255, 255]);

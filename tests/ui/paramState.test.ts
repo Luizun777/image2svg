@@ -104,3 +104,30 @@ describe('applyTunedParams', () => {
     expect('optimize' in next).toBe(false);
   });
 });
+
+describe('gradient mode parameters', () => {
+  it('are part of the compared state; gradient defaults to cutout layers', () => {
+    expect(diffParams({ mode: 'flat' }, { mode: 'gradient' }, 'flat')).toEqual(['mode', 'layering']);
+    expect(diffParams({}, { maxStops: 4, regionDetail: 1.5, radialGradients: false }, 'gradient')).toEqual([
+      'regionDetail',
+      'maxStops',
+      'radialGradients',
+    ]);
+    expect(diffParams({ maxStops: 8, regionDetail: 1 }, {}, 'gradient')).toEqual([]);
+    expect(sameTrace({ mode: 'auto' }, { mode: 'gradient' }, 'gradient')).toBe(true);
+  });
+
+  it('describes the gradient controls with Spanish formatting, in schema order', () => {
+    expect(describeParamChanges({}, { regionDetail: 1.5 }, 'gradient')).toEqual(['Detalle de regiones: 1,0 → 1,5']);
+    expect(describeParamChanges({}, { maxStops: 4 }, 'gradient')).toEqual(['Paradas máximas: 8 → 4']);
+    expect(describeParamChanges({}, { radialGradients: false }, 'gradient')).toEqual(['Degradados radiales: sí → no']);
+    expect(
+      describeParamChanges({ mode: 'auto' }, { mode: 'auto', radialGradients: false, maxStops: 4, regionDetail: 1.5 }, 'gradient'),
+    ).toEqual(['Detalle de regiones: 1,0 → 1,5', 'Paradas máximas: 8 → 4', 'Degradados radiales: sí → no']);
+    // Switching to Degradados also brings its cutout default, and says so.
+    expect(describeParamChanges({ mode: 'flat' }, { mode: 'gradient' }, 'flat')).toEqual([
+      'Modo: Color plano → Degradados',
+      'Capas: Apiladas → Recortadas',
+    ]);
+  });
+});

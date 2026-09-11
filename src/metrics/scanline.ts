@@ -4,7 +4,8 @@
  * coverage, so axis-aligned integer rectangles are pixel-exact and edges get fractional
  * coverage. Never mutates inputs.
  */
-import type { AbsPath, GrayImage, Layer, RasterImage, RGB } from '../types';
+import type { AbsPath, Gradient, GradientStop, GrayImage, Layer, RasterImage, RGB } from '../types';
+import { gradientT, isDegenerateGradient, stopColorAt } from '../core/fillEval';
 
 type Pt = [number, number];
 
@@ -13,6 +14,10 @@ const MAX_DEPTH = 16;
 const DEFAULT_TOLERANCE = 0.1;
 const DEFAULT_SUPERSAMPLE = 4;
 const MAX_SUPERSAMPLE = 64;
+/** Fewest steps of a gradient colour LUT (256 entries, t step 1/255). */
+const GRADIENT_LUT_MIN_STEPS = 255;
+/** Most steps of a gradient colour LUT; a steeper ramp is evaluated exactly per pixel instead. */
+const GRADIENT_LUT_MAX_STEPS = 4095;
 
 function pushPt(out: Pt[], x: number, y: number): void {
   const n = out.length;
@@ -377,12 +382,123 @@ function parseFill(fill: string): RGB {
   throw new Error(`rasterizeLayers: color de relleno no válido: "${fill}"`);
 }
 
+function clampLevel(v: number): number {
+  return v > 0 ? (v < 255 ? v : 255) : 0; // NaN -> 0
+}
+
+interface GradientLut {
+  /** (steps + 1) RGB triplets: entry k = the ramp at t = k / steps, clamped to 0..255. */
+  rgb: Float32Array;
+  steps: number;
+}
+
+/**
+ * Colour lookup table of a gradient ramp, sampled with stopColorAt (core/fillEval). steps =
+ * max(255, ceil(s)), s = the steepest colour change between consecutive stops in levels per unit of
+ * t, so the entry nearest to any t is within s / (2 steps) <= 0.5 level of the exact colour (a
+ * 2-stop 0 -> 255 ramp gets the plain 256 entries). Null, and the caller evaluates every pixel
+ * exactly, when that needs more than GRADIENT_LUT_MAX_STEPS steps or when the ramp may jump: a
+ * non-finite value, a decreasing offset, or a colour change over a zero offset span.
+ */
+function gradientLut(stops: readonly GradientStop[]): GradientLut | null {
+  let slope = 0;
+  for (let i = 0; i < stops.length; i++) {
+    const b = stops[i];
+    if (!Number.isFinite(b.offset)) return null;
+    for (let k = 0; k < 3; k++) if (!Number.isFinite(b.color[k])) return null;
+    if (i === 0) continue;
+    const a = stops[i - 1];
+    const span = b.offset - a.offset;
+    if (span < 0) return null;
+    let change = 0;
+    for (let k = 0; k < 3; k++) change = Math.max(change, Math.abs(b.color[k] - a.color[k]));
+    if (change === 0) continue;
+    if (span === 0) return null;
+    slope = Math.max(slope, change / span);
+  }
+  const steps = Math.max(GRADIENT_LUT_MIN_STEPS, Math.ceil(slope));
+  if (!(steps <= GRADIENT_LUT_MAX_STEPS)) return null;
+  const rgb = new Float32Array((steps + 1) * 3);
+  const c: RGB = [0, 0, 0];
+  for (let k = 0, o = 0; k <= steps; k++, o += 3) {
+    stopColorAt(stops, k / steps, c);
+    rgb[o] = clampLevel(c[0]);
+    rgb[o + 1] = clampLevel(c[1]);
+    rgb[o + 2] = clampLevel(c[2]);
+  }
+  return { rgb, steps };
+}
+
+/**
+ * Blends one gradient layer into the premultiplied accumulators, like a solid fill but with the
+ * colour of pixel (x, y) = the ramp at gradientT(g, x + 0.5, y + 0.5) (the gradient is in the
+ * raster's own units), read from the nearest gradientLut entry or, without a LUT, from stopColorAt;
+ * channels clamped to 0..255 (what an SVG stop-color can hold). `accA` is null over an opaque
+ * background (alpha stays 1).
+ */
+function blendGradient(
+  g: Gradient,
+  cov: Float32Array,
+  w: number,
+  h: number,
+  scale: number,
+  accR: Float32Array,
+  accG: Float32Array,
+  accB: Float32Array,
+  accA: Float32Array | null,
+): void {
+  const lut = gradientLut(g.stops);
+  // A local reference: a per-call module binding lookup (vitest's SSR transform) costs 1.98x instead of 1.41x.
+  const tAt = gradientT;
+  if (lut === null) {
+    const c: RGB = [0, 0, 0];
+    for (let y = 0; y < h; y++) {
+      const row = y * w;
+      const cy = y + 0.5;
+      for (let x = 0; x < w; x++) {
+        const i = row + x;
+        const cv = cov[i];
+        if (cv === 0) continue;
+        stopColorAt(g.stops, tAt(g, x + 0.5, cy), c);
+        const a = cv * scale;
+        const ia = 1 - a;
+        accR[i] = clampLevel(c[0]) * a + accR[i] * ia;
+        accG[i] = clampLevel(c[1]) * a + accG[i] * ia;
+        accB[i] = clampLevel(c[2]) * a + accB[i] * ia;
+        if (accA !== null) accA[i] = a + accA[i] * ia;
+      }
+    }
+    return;
+  }
+  const rgb = lut.rgb;
+  const steps = lut.steps;
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    const cy = y + 0.5;
+    for (let x = 0; x < w; x++) {
+      const i = row + x;
+      const cv = cov[i];
+      if (cv === 0) continue;
+      const o = ((tAt(g, x + 0.5, cy) * steps + 0.5) | 0) * 3; // t in [0, 1]
+      const a = cv * scale;
+      const ia = 1 - a;
+      accR[i] = rgb[o] * a + accR[i] * ia;
+      accG[i] = rgb[o + 1] * a + accG[i] * ia;
+      accB[i] = rgb[o + 2] * a + accB[i] * ia;
+      if (accA !== null) accA[i] = a + accA[i] * ia;
+    }
+  }
+}
+
 /**
  * Composite `layers` back to front (first = bottom) over an opaque `background`, or over
  * transparency when it is null. Per layer a = coverage/255 * opacity and
  * out = fill * a + out * (1 - a). With a null background the alpha channel is the union
  * coverage (a + alpha * (1 - a)) and the colours are stored straight (un-premultiplied), so the
  * result composites correctly over any colour later. Values rounded to the nearest byte.
+ * A layer with a non-degenerate `gradient` (isDegenerateGradient) takes its per-pixel colour from
+ * it (blendGradient, within 1 level of evaluateFill at the pixel centre); a degenerate one paints
+ * `fill`. Every layer's `fill` must be a hex colour, gradient or not.
  */
 export function rasterizeLayers(
   layers: Layer[],
@@ -417,6 +533,11 @@ export function rasterizeLayers(
     if (n === 0 || layer.paths.length === 0) continue;
     const cov = rasterizeMask(layer.paths, w, h, supersample).data;
     const scale = op / 255;
+    const gradient = layer.gradient;
+    if (gradient !== undefined && !isDegenerateGradient(gradient)) {
+      blendGradient(gradient, cov, w, h, scale, accR, accG, accB, opaque ? null : accA);
+      continue;
+    }
     for (let i = 0; i < n; i++) {
       const c = cov[i];
       if (c === 0) continue;

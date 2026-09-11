@@ -1,9 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { assembleSvg, rgbToHex } from '../../src/svg/assemble';
+import { assembleSvg, gradientIdPrefix, rgbToHex } from '../../src/svg/assemble';
 import { parsePathData } from '../../src/svg/pathParse';
 import { countSegments } from '../../src/svg/pathStats';
 import type { AssembleOptions } from '../../src/svg/assemble';
-import type { AbsPath, Layer, Seg } from '../../src/types';
+import type { AbsPath, Gradient, Layer, LinearGradient, RadialGradient, Seg } from '../../src/types';
 
 const M = (x: number, y: number): Seg => ({ kind: 'M', x, y });
 const L = (x: number, y: number): Seg => ({ kind: 'L', x, y });
@@ -14,6 +14,18 @@ const HOLE: AbsPath = { segs: [M(24, 24), L(24, 40), L(40, 40), L(40, 24), Z] };
 const BASE: AssembleOptions = { width: 16, height: 16, viewBoxWidth: 64, viewBoxHeight: 64 };
 
 const escapeRe = (s: string): string => s.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+
+/**
+ * The document with its gradient ids g<h>-<n> written as g<n>, after checking that h is gradientIdPrefix of exactly that
+ * document (the ids are a function of the output with plain ids).
+ */
+function plainIds(svg: string): string {
+  const m = /<(?:linear|radial)Gradient id="g([0-9a-z]+)-0"/.exec(svg);
+  if (m === null) return svg;
+  const plain = svg.split(`g${m[1]}-`).join('g');
+  expect(gradientIdPrefix(plain)).toBe(m[1]);
+  return plain;
+}
 
 describe('assembleSvg — document structure', () => {
   it('starts with the exact <svg> header (original size, upscaled viewBox) and ends with </svg>', () => {
@@ -158,5 +170,183 @@ describe('assembleSvg — path attributes', () => {
       expect(line).toMatch(/^<(rect|path) [^<>]*\/>$/);
       expect((line.match(/"/g) ?? []).length % 2).toBe(0);
     }
+  });
+});
+
+describe('assembleSvg — gradients', () => {
+  const LIN: LinearGradient = {
+    kind: 'linear',
+    x1: 16,
+    y1: 16,
+    x2: 48.12345,
+    y2: 47.5,
+    stops: [
+      { offset: 0, color: [254, 218, 117] },
+      { offset: 1, color: [150, 47, 191] },
+    ],
+  };
+  const RAD: RadialGradient = {
+    kind: 'radial',
+    cx: 32,
+    cy: 32.0004,
+    r: 16,
+    stops: [
+      { offset: 0, color: [255, 255, 255] },
+      { offset: 0.5, color: [214, 41, 118] },
+      { offset: 1, color: [0, 0, 0] },
+    ],
+  };
+  const LIN_LINE =
+    '<linearGradient id="g0" gradientUnits="userSpaceOnUse" x1="16" y1="16" x2="48.123" y2="47.5">' +
+    '<stop offset="0" stop-color="#feda75"/><stop offset="1" stop-color="#962fbf"/></linearGradient>';
+  const RAD_LINE =
+    '<radialGradient id="g1" gradientUnits="userSpaceOnUse" cx="32" cy="32" r="16">' +
+    '<stop offset="0" stop-color="#ffffff"/><stop offset="0.5" stop-color="#d62976"/><stop offset="1" stop-color="#000000"/></radialGradient>';
+
+  it('<defs> right after <svg> and before the background rect; url(#gN) fills; attribute order fill, fill-opacity, fill-rule, d', () => {
+    const layers: Layer[] = [
+      { fill: '#c8a098', gradient: LIN, paths: [SQUARE] },
+      { fill: '#112233', paths: [HOLE] },
+      { fill: '#6b4a5c', gradient: RAD, opacity: 0.5, paths: [SQUARE, HOLE] },
+    ];
+    const svg = plainIds(assembleSvg(layers, { ...BASE, background: [255, 255, 255] }));
+    expect(svg.split('\n')).toEqual([
+      '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 64 64">',
+      '<defs>',
+      LIN_LINE,
+      RAD_LINE,
+      '</defs>',
+      '<rect fill="#ffffff" width="64" height="64"/>',
+      '<path fill="url(#g0)" d="M16 16L48 16 48 48 16 48Z"/>',
+      '<path fill="#112233" d="M24 24L24 40 40 40 40 24Z"/>',
+      '<path fill="url(#g1)" fill-opacity="0.5" fill-rule="evenodd" d="M16 16L48 16 48 48 16 48ZM24 24L24 40 40 40 40 24Z"/>',
+      '</svg>',
+    ]);
+  });
+
+  it('with crispEdges the <defs> follow the complete opening tag', () => {
+    const svg = plainIds(assembleSvg([{ fill: '#000000', gradient: LIN, paths: [SQUARE] }], { ...BASE, crispEdges: true }));
+    expect(svg.startsWith('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 64 64" shape-rendering="crispEdges">\n<defs>\n<linearGradient id="g0" ')).toBe(true);
+  });
+
+  it('ids g<h>-0, g<h>-1… count only drawn layers with a non-degenerate gradient, in layer order', () => {
+    const oneStop: LinearGradient = { ...LIN, stops: [LIN.stops[0]] };
+    const layers: Layer[] = [
+      { fill: '#010101', gradient: LIN, paths: [] },
+      { fill: '#aa0000', gradient: oneStop, paths: [SQUARE] },
+      { fill: '#020202', gradient: RAD, paths: [HOLE] },
+      { fill: '#030303', gradient: LIN, paths: [{ segs: [] }] },
+      { fill: '#040404', gradient: LIN, paths: [SQUARE] },
+    ];
+    const svg = plainIds(assembleSvg(layers, BASE));
+    expect((svg.match(/<defs>/g) ?? []).length).toBe(1);
+    expect(svg.match(/<(linear|radial)Gradient id="g\d+"/g)).toEqual(['<radialGradient id="g0"', '<linearGradient id="g1"']);
+    expect(svg.match(/<path fill="[^"]*"/g)).toEqual(['<path fill="#aa0000"', '<path fill="url(#g0)"', '<path fill="url(#g1)"']);
+  });
+
+  it('degenerate gradients fall back to layer.fill: all degenerate → byte-identical to the layers without them', () => {
+    const degenerate: Gradient[] = [
+      { ...LIN, stops: [] },
+      { ...LIN, stops: [LIN.stops[1]] },
+      { ...LIN, x2: 16, y2: 16 },
+      { ...LIN, x1: Number.NaN },
+      { ...RAD, r: 0 },
+      { ...RAD, r: -3 },
+      { ...RAD, r: Number.POSITIVE_INFINITY },
+      { ...RAD, stops: [{ offset: 0, color: [10, 10, 10] }, { offset: 1, color: [11, 10.5, 10] }] },
+    ];
+    const opts: AssembleOptions = { ...BASE, background: [1, 2, 3], crispEdges: true };
+    const plain = assembleSvg([{ fill: '#123456', opacity: 0.25, paths: [SQUARE, HOLE] }], opts);
+    for (const g of degenerate) {
+      expect(assembleSvg([{ fill: '#123456', gradient: g, opacity: 0.25, paths: [SQUARE, HOLE] }], opts)).toBe(plain);
+    }
+    // a degenerate layer next to a real one keeps its escaped flat fill
+    const mixed = plainIds(
+      assembleSvg(
+        [
+          { fill: 'url("#x")<&', gradient: degenerate[2], paths: [SQUARE] },
+          { fill: 'ignored', gradient: RAD, paths: [HOLE] },
+        ],
+        BASE,
+      ),
+    );
+    expect(mixed).toMatch(/<path fill="url\(&quot;#x&quot;\)&lt;&amp;" d="/);
+    expect(mixed).toMatch(/<path fill="url\(#g0\)" d="/);
+    expect(mixed).not.toContain('ignored');
+  });
+
+  it('two different documents never share a gradient id; the same layers always get the same ids', () => {
+    const other: LinearGradient = { ...LIN, stops: [{ offset: 0, color: [1, 2, 3] }, { offset: 1, color: [200, 100, 50] }] };
+    const a = assembleSvg([{ fill: '#000000', gradient: LIN, paths: [SQUARE] }, { fill: '#000000', gradient: RAD, paths: [HOLE] }], BASE);
+    const b = assembleSvg([{ fill: '#000000', gradient: other, paths: [SQUARE] }], BASE);
+    const ids = (svg: string): string[] => [...svg.matchAll(/<(?:linear|radial)Gradient id="([^"]+)"/g)].map((m) => m[1]);
+    const idsA = ids(a);
+    const idsB = ids(b);
+    expect(idsA).toHaveLength(2);
+    expect(idsB).toHaveLength(1);
+    for (const id of [...idsA, ...idsB]) expect(id).toMatch(/^[A-Za-z_][A-Za-z0-9_.-]*$/);
+    expect(idsA.filter((id) => idsB.includes(id))).toEqual([]);
+    expect(new Set(idsA).size).toBe(2);
+    // every reference points at an id of its own document
+    for (const [svg, own] of [[a, idsA], [b, idsB]] as const) {
+      for (const m of svg.matchAll(/fill="url\(#([^)]+)\)"/g)) expect(own).toContain(m[1]);
+    }
+    expect(assembleSvg([{ fill: '#000000', gradient: LIN, paths: [SQUARE] }, { fill: '#000000', gradient: RAD, paths: [HOLE] }], BASE)).toBe(a);
+  });
+
+  it('without gradients the output is byte-identical whether or not the key is present', () => {
+    const layers: Layer[] = [
+      { fill: '#112233', opacity: 0.5, paths: [SQUARE, HOLE] },
+      { fill: '#445566', paths: [] },
+      { fill: '#aabbcc', paths: [HOLE] },
+    ];
+    const withKey: Layer[] = layers.map((l) => ({ ...l, gradient: undefined }));
+    const opts: AssembleOptions = { ...BASE, background: [9, 8, 7], precision: 2 };
+    const svg = assembleSvg(withKey, opts);
+    expect(svg).toBe(assembleSvg(layers, opts));
+    expect(svg).not.toMatch(/<defs|url\(/);
+  });
+
+  it('gradient coordinates use the same precision as the path data; offsets keep 4 decimals', () => {
+    const g: LinearGradient = { ...LIN, x1: 1.23456, stops: [{ offset: 1 / 3, color: [0, 0, 0] }, { offset: 1, color: [9, 9, 9] }] };
+    const p: AbsPath = { segs: [M(1.23456, 2.34567), L(3.45678, 4.56789), Z] };
+    const two = assembleSvg([{ fill: '#000000', gradient: g, paths: [p] }], { ...BASE, precision: 2 });
+    expect(two).toContain(' x1="1.23" y1="16" x2="48.12" y2="47.5"><stop offset="0.3333" ');
+    expect(two).toContain(' d="M1.23 2.35L3.46 4.57Z"/>');
+    const zero = assembleSvg([{ fill: '#000000', gradient: g, paths: [p] }], { ...BASE, precision: 0 });
+    expect(zero).toContain(' x1="1" y1="16" x2="48" y2="48"><stop offset="0.3333" ');
+    expect(zero).toContain(' d="M1 2L3 5Z"/>');
+  });
+
+  it('never leaks "undefined"/"NaN", keeps one element per line and does not mutate layers or gradients', () => {
+    const messy: LinearGradient = {
+      ...LIN,
+      stops: [
+        { offset: 0.9, color: [1, 2, 3] },
+        { offset: -0.2, color: [300, 5, 6] },
+        { offset: 0.9, color: [7, 8, 9] },
+      ],
+    };
+    const layers: Layer[] = [
+      { fill: '#000000', gradient: messy, opacity: 0.5, paths: [SQUARE, HOLE] },
+      { fill: '#ffffff', paths: [HOLE] },
+      { fill: '#808080', gradient: RAD, paths: [SQUARE] },
+    ];
+    const before = JSON.stringify(layers);
+    const svg = plainIds(assembleSvg(layers, { ...BASE, background: [1, 2, 3], crispEdges: true }));
+    expect(svg).not.toMatch(/undefined|NaN|null/);
+    expect(JSON.stringify(layers)).toBe(before);
+    const lines = svg.split('\n').slice(1, -1);
+    expect(lines[0]).toBe('<defs>');
+    expect(lines[3]).toBe('</defs>');
+    for (const line of lines.slice(1, 3)) {
+      expect(line).toMatch(/^<(linear|radial)Gradient id="g\d" gradientUnits="userSpaceOnUse" [^<>]*>(<stop offset="[\d.]+" stop-color="#[0-9a-f]{6}"\/>)+<\/(linear|radial)Gradient>$/);
+    }
+    for (const line of lines.slice(4)) {
+      expect(line).toMatch(/^<(rect|path) [^<>]*\/>$/);
+      expect((line.match(/"/g) ?? []).length % 2).toBe(0);
+    }
+    // normalizeStops on the way out: -0.2 is raised to 0.9, and of the three stops at 0.9 the first and the last stay
+    expect(lines[1].match(/offset="[^"]*" stop-color="[^"]*"/g)).toEqual(['offset="0.9" stop-color="#010203"', 'offset="0.9" stop-color="#070809"']);
   });
 });

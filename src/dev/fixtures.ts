@@ -1,6 +1,6 @@
 /**
  * Dev-only `?synth=` loader: builds one of the synthetic images of ./synth so the app can be
- * exercised without files (`?synth=circle|line|glyph|flat|sprite|logo`). Pure TypeScript, like
+ * exercised without files (`?synth=circle|line|glyph|flat|sprite|logo|gradient|radial`). Pure TypeScript, like
  * the rest of src/dev: the app turns the RasterImage into ImageData.
  *
  * Sizes are larger than the unit-test defaults so the preview has something to look at; the
@@ -12,12 +12,14 @@ import {
   aaDiagonalLine,
   flatShapes3,
   glyph,
+  gradientFeathers,
   nearestUpscale,
+  radialDisc,
   sprite32,
   transparentLogo,
 } from './synth';
 
-export const SYNTH_FIXTURES = ['circle', 'line', 'glyph', 'flat', 'sprite', 'logo'] as const;
+export const SYNTH_FIXTURES = ['circle', 'line', 'glyph', 'flat', 'sprite', 'logo', 'gradient', 'radial'] as const;
 export type SynthFixtureName = (typeof SYNTH_FIXTURES)[number];
 
 export interface SynthFixture {
@@ -53,6 +55,12 @@ export function buildSynthFixture(name: SynthFixtureName): SynthFixture {
       break;
     case 'logo':
       image = transparentLogo(128).image;
+      break;
+    case 'gradient':
+      image = gradientFeathers(512).image;
+      break;
+    case 'radial':
+      image = radialDisc(256).image;
       break;
   }
   return { fileName: `synth-${name}.png`, image };
