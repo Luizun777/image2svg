@@ -1,0 +1,6 @@
+/* image2svg UI stylesheet entry. JetBrains Mono (figures and code) is self-hosted from
+   @fontsource-variable like Manrope, which src/main.ts imports. */
+@import '@fontsource-variable/jetbrains-mono';
+@import './tokens.css';
+@import './controls.css';
+@import './layout.css';

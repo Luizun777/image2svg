@@ -1,0 +1,250 @@
+/* Design tokens ("Mesa de luz", DESIGN.md) and base elements. Light first; dark via
+   prefers-color-scheme, and [data-theme] wins in both directions. */
+
+:root {
+  color-scheme: light;
+  --paper: #f6f7f9;
+  --surface: #ffffff;
+  --canvas: #eceff3;
+  --ink: #0f172a;
+  --muted: #5b6577;
+  --line: #dfe4ec;
+  --line-control: #cdd4de;
+  --line-strong: #8a95a8;
+  --accent: #2451e6;
+  --accent-deep: #1a3fbf;
+  --on-accent: #ffffff;
+  --accent-soft: rgb(36 81 230 / 0.12);
+  --inverse-bg: #0f172a;
+  --inverse-ink: #f6f7f9;
+  /* Signal colours are also small text: >= 4.5:1 on paper, surface and their tinted banners in
+     both themes, same OKLCH hue per signal (tests/ui/contrast.test.ts). */
+  --signal-ok: #127249;
+  --signal-warn: #8f5d10;
+  --signal-bad: #b42633;
+  --warn-surface: #fdf6ea;
+  --warn-line: #ead4ae;
+  --bad-surface: #fcf0f1;
+  --bad-line: #efc4c8;
+  --overlay-corner: #e11d48;
+  --overlay-curve: #2563eb;
+  --node-halo: #ffffff;
+  --checker-a: #ffffff;
+  --checker-b: #e6eaf0;
+  --shadow-float: 0 8px 24px rgb(15 23 42 / 0.08);
+  --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='%23ffffff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='%235b6577' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --space-xs: 4px;
+  --space-sm: 8px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 40px;
+
+  --font: 'Manrope Variable', 'Manrope', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono Variable', 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  --text-display: 1.25rem;
+  --text-title: 1.0625rem;
+  --text-body: 0.9375rem;
+  --text-label: 0.8125rem;
+  --text-small: 0.75rem;
+  --text-metric: 2.5rem;
+
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+  --dur-fast: 150ms;
+  --dur-base: 200ms;
+  --topbar-height: 60px;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+    --paper: #0b0f17;
+    --surface: #121826;
+    --canvas: #0e131d;
+    --ink: #e7eaf0;
+    --muted: #8d97a9;
+    --line: #222c3d;
+    --line-control: #2e3a4f;
+    --line-strong: #6b7a96;
+    --accent: #7b96ff;
+    --accent-deep: #9db0ff;
+    --on-accent: #0b0f17;
+    --accent-soft: rgb(123 150 255 / 0.16);
+    --inverse-bg: #e7eaf0;
+    --inverse-ink: #0b0f17;
+    --signal-ok: #3ebf85;
+    --signal-warn: #d7953d;
+    --signal-bad: #ff7173;
+    --warn-surface: #221b10;
+    --warn-line: #4d3b1c;
+    --bad-surface: #25141a;
+    --bad-line: #55252e;
+    --node-halo: #0b0f17;
+    --checker-a: #1b2232;
+    --checker-b: #131926;
+    --shadow-float: 0 8px 24px rgb(0 0 0 / 0.35);
+    --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='%230b0f17' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+    --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='%238d97a9' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+  --paper: #0b0f17;
+  --surface: #121826;
+  --canvas: #0e131d;
+  --ink: #e7eaf0;
+  --muted: #8d97a9;
+  --line: #222c3d;
+  --line-control: #2e3a4f;
+  --line-strong: #6b7a96;
+  --accent: #7b96ff;
+  --accent-deep: #9db0ff;
+  --on-accent: #0b0f17;
+  --accent-soft: rgb(123 150 255 / 0.16);
+  --inverse-bg: #e7eaf0;
+  --inverse-ink: #0b0f17;
+  --signal-ok: #3ebf85;
+  --signal-warn: #d7953d;
+  --signal-bad: #ff7173;
+  --warn-surface: #221b10;
+  --warn-line: #4d3b1c;
+  --bad-surface: #25141a;
+  --bad-line: #55252e;
+  --node-halo: #0b0f17;
+  --checker-a: #1b2232;
+  --checker-b: #131926;
+  --shadow-float: 0 8px 24px rgb(0 0 0 / 0.35);
+  --check-mark: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M3.5 8.5l3 3 6-6.5' fill='none' stroke='%230b0f17' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  --chevron: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Cpath d='M4 6l4 4 4-4' fill='none' stroke='%238d97a9' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+}
+
+/* ---- base ---------------------------------------------------------------------------------- */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+[hidden] {
+  display: none !important;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
+}
+
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: var(--font);
+  font-size: var(--text-body);
+  font-weight: 450;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  font-variant-numeric: tabular-nums;
+}
+
+h1,
+h2,
+h3,
+p,
+ol,
+ul,
+dl,
+dd {
+  margin: 0;
+}
+
+button,
+input,
+select {
+  font: inherit;
+  color: inherit;
+}
+
+/* Figures and code: JetBrains Mono with tabular numerals, so values do not dance as they update. */
+code,
+pre,
+samp {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+a {
+  color: var(--accent);
+  text-underline-offset: 2px;
+  transition: color var(--dur-fast) var(--ease-out);
+}
+
+a:hover {
+  color: var(--accent-deep);
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+kbd {
+  display: inline-block;
+  margin-inline: 2px;
+  padding: 0 6px;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  font: inherit;
+  font-size: var(--text-small);
+  font-weight: 650;
+  line-height: 1.6;
+}
+
+.sr-only {
+  position: absolute !important;
+  width: 1px;
+  height: 1px;
+  margin: -1px;
+  padding: 0;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.icon {
+  display: block;
+  flex: none;
+}
+
+@keyframes pulse {
+  50% {
+    opacity: 0.55;
+  }
+}
+
+@keyframes indeterminate {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(340%);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}

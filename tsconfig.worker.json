@@ -1,0 +1,19 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ES2023", "WebWorker"],
+    "types": ["vite/client"]
+  },
+  "include": [
+    "src/workers/**/*.ts",
+    "src/core/**/*.ts",
+    "src/tracers/**/*.ts",
+    "src/svg/**/*.ts",
+    "src/metrics/**/*.ts",
+    "src/tuner/**/*.ts",
+    "src/types.ts",
+    "src/types/**/*.ts",
+    "src/vite-env.d.ts"
+  ],
+  "exclude": []
+}
