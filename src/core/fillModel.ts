@@ -90,6 +90,17 @@ export const RADIAL_MIN_CONDITION = 0.05;
 export const RADIAL_MIN_RADIUS = 2;
 /** Monotonicity of the dominant channel along ρ: reversals up to RADIAL_MONOTONE_EPS_FACTOR · eps are noise. */
 export const RADIAL_MONOTONE_EPS_FACTOR = 2;
+/**
+ * splitComplex: k-means (k = 2) iterations over (x, y, signed luma residual). 12 is where the belly of pajaro stops
+ * moving pixels (measurements in ARCHITECTURE.md, "Degradados, división de regiones complejas").
+ */
+export const SPLIT_KMEANS_ITERATIONS = 12;
+/** The split is kept only when the core-weighted RMSE of the parts is at most this ratio of the whole region's ... */
+export const SPLIT_MAX_RMSE_RATIO = 0.8;
+/** ... and at least this many levels below it. Both bounds: a clear relative AND absolute gain. */
+export const SPLIT_MIN_RMSE_GAIN = 1.5;
+/** Levels of k = 2 splits (a part still complex is split again), so at most 2^depth parts per region. */
+export const SPLIT_MAX_DEPTH = 2;
 /** planMerges defaults. */
 export const MERGE_MIN_AREA_FLOOR = 16;
 export const MERGE_MIN_AREA_SHARE = 2e-5;
@@ -1343,12 +1354,202 @@ export function extendGradient(img: RasterImage, fill: Gradient, pixels: Int32Ar
   return rmseOnList(img, pixels, extended) < rmseOnList(img, pixels, fill) ? extended : fill;
 }
 
+/** The model selectModel picks for an explicit pixel list, fitted as a single region. */
+function modelOfList(img: RasterImage, indices: Int32Array, opts: FitOptions & { radial?: boolean }): RegionModel {
+  const px: RegionPixels = { offsets: Int32Array.from([0, indices.length]), indices };
+  return selectModel(img, px, 0, momentsOf(img, indices), { sigma: opts.sigma, maxStops: opts.maxStops, radial: opts.radial ?? true });
+}
+
 /**
- * OPTIONAL in the contract and not implemented in this version: always null, so a complex region keeps
- * its best candidate (selectModel). The signature is kept for the pipeline.
+ * Deterministic k-means with k = 2 over three features of each pixel of `indices`, each scaled to [0, 1] so the
+ * geometry and the colour error weigh the same: x and y by the bounding box of the list, and the SIGNED luma
+ * residual of `fill` by its range over the list. Seeded from the most positive and the most negative residual
+ * pixel (ties: the lower raster index, so the seeds do not depend on the iteration order), at most
+ * SPLIT_KMEANS_ITERATIONS sweeps, stopping as soon as no pixel changes cluster; a tie in the distance goes to
+ * the first cluster. The residual is what a single-axis ramp gets wrong, so its sign separates the two shadings
+ * that a 2-D shading superimposes, while x and y keep each part in one piece.
+ * Returns the two lists in raster order, or null when the residual has no range (nothing to separate) or one
+ * cluster comes out empty.
  */
-export function splitComplex(_img: RasterImage, _px: RegionPixels, _id: number, _opts: FitOptions): { assign: Uint8Array; fills: Fill[] } | null {
-  return null;
+function kmeansResidualSplit(img: RasterImage, indices: Int32Array, fill: Fill): [Int32Array, Int32Array] | null {
+  const n = indices.length;
+  const W = img.width;
+  const d = img.data;
+  const c: RGB = [0, 0, 0];
+  let minX = Infinity;
+  let maxX = -Infinity;
+  let minY = Infinity;
+  let maxY = -Infinity;
+  const res = new Float64Array(n);
+  let hi = -Infinity;
+  let lo = Infinity;
+  let hiAt = 0;
+  let loAt = 0;
+  for (let i = 0; i < n; i++) {
+    const p = indices[i];
+    const x = p % W;
+    const y = (p - x) / W;
+    if (x < minX) minX = x;
+    if (x > maxX) maxX = x;
+    if (y < minY) minY = y;
+    if (y > maxY) maxY = y;
+    evaluateFill(fill, x + 0.5, y + 0.5, c);
+    const o = p * 4;
+    const r = 0.299 * (d[o] - c[0]) + 0.587 * (d[o + 1] - c[1]) + 0.114 * (d[o + 2] - c[2]);
+    res[i] = r;
+    if (r > hi) {
+      hi = r;
+      hiAt = i;
+    }
+    if (r < lo) {
+      lo = r;
+      loAt = i;
+    }
+  }
+  const span = hi - lo;
+  if (!(span > 0)) return null;
+  const sx = Math.max(1, maxX - minX + 1);
+  const sy = Math.max(1, maxY - minY + 1);
+  const fx = new Float64Array(n);
+  const fy = new Float64Array(n);
+  const fr = new Float64Array(n);
+  for (let i = 0; i < n; i++) {
+    const p = indices[i];
+    const x = p % W;
+    fx[i] = (x + 0.5 - minX) / sx;
+    fy[i] = ((p - x) / W + 0.5 - minY) / sy;
+    fr[i] = (res[i] - lo) / span;
+  }
+  let ax = fx[hiAt];
+  let ay = fy[hiAt];
+  let ar = fr[hiAt];
+  let bx = fx[loAt];
+  let by = fy[loAt];
+  let br = fr[loAt];
+  const side = new Uint8Array(n);
+  for (let pass = 0; pass < SPLIT_KMEANS_ITERATIONS; pass++) {
+    let moved = false;
+    let n0 = 0;
+    let s0x = 0;
+    let s0y = 0;
+    let s0r = 0;
+    let s1x = 0;
+    let s1y = 0;
+    let s1r = 0;
+    for (let i = 0; i < n; i++) {
+      const u = fx[i];
+      const v = fy[i];
+      const w = fr[i];
+      const da = (u - ax) * (u - ax) + (v - ay) * (v - ay) + (w - ar) * (w - ar);
+      const db = (u - bx) * (u - bx) + (v - by) * (v - by) + (w - br) * (w - br);
+      const s = da <= db ? 0 : 1;
+      if (s !== side[i]) {
+        side[i] = s;
+        moved = true;
+      }
+      if (s === 0) {
+        n0++;
+        s0x += u;
+        s0y += v;
+        s0r += w;
+      } else {
+        s1x += u;
+        s1y += v;
+        s1r += w;
+      }
+    }
+    const n1 = n - n0;
+    if (n0 === 0 || n1 === 0) return null;
+    if (!moved) break;
+    ax = s0x / n0;
+    ay = s0y / n0;
+    ar = s0r / n0;
+    bx = s1x / n1;
+    by = s1y / n1;
+    br = s1r / n1;
+  }
+  let n0 = 0;
+  for (let i = 0; i < n; i++) if (side[i] === 0) n0++;
+  const a = new Int32Array(n0);
+  const b = new Int32Array(n - n0);
+  let ia = 0;
+  let ib = 0;
+  for (let i = 0; i < n; i++) {
+    if (side[i] === 0) a[ia++] = indices[i];
+    else b[ib++] = indices[i];
+  }
+  return [a, b];
+}
+
+/**
+ * Splits a region no single fill explains (selectModel's complex) into 2..2^maxDepth parts, each with its own
+ * solid, linear or radial fill: the SVG-expressible answer to a 2-D shading, where the three channels' colour
+ * gradients are not collinear and no one-axis gradient can follow them (pajaro's belly: fitPlane 4.03 against
+ * 8.81 for the best ramp, and more stops do not help because Douglas-Peucker has already converged).
+ *
+ * One level = kmeansResidualSplit (k = 2 on x, y and the signed luma residual of the region's current fill) and
+ * selectModel on each part. The level is kept only when both parts have at least MIN_MODEL_CORE core pixels (so
+ * each gets a real model instead of the solid floor of the ladder) AND the core-weighted RMSE of the two parts
+ * is at most SPLIT_MAX_RMSE_RATIO of the region's own RMSE and at least SPLIT_MIN_RMSE_GAIN levels below it;
+ * otherwise that branch stays whole. A part the ladder still calls complex is split again, up to maxDepth levels
+ * (default SPLIT_MAX_DEPTH). Returns null when nothing was split.
+ *
+ * `px` are the core pixels (corePixels, or the pipeline's fit core) and `opts.fill` the region's current best
+ * fill (the caller already has it; without it splitComplex fits one). assign[i] = the part of the i-th core pixel
+ * of `id`, in the order of `px`; fills[p] = the fill of part p. Pixels of the region that are NOT core (the edge
+ * band) are not in `px` and the caller assigns them (the pipeline: to the part whose fill predicts them best).
+ * Pure and deterministic: no random seeds and no iteration that depends on insertion order.
+ */
+export function splitComplex(
+  img: RasterImage,
+  px: RegionPixels,
+  id: number,
+  opts: FitOptions & { radial?: boolean; fill?: Fill; maxDepth?: number },
+): { assign: Uint8Array; fills: Fill[] } | null {
+  const start = px.offsets[id];
+  const n = px.offsets[id + 1] - start;
+  // Below two parts' worth of core pixels no split can leave both of them with a model of their own.
+  if (n < 2 * MIN_MODEL_CORE) return null;
+  const maxDepth = opts.maxDepth === undefined ? SPLIT_MAX_DEPTH : Math.floor(opts.maxDepth);
+  if (!(maxDepth >= 1)) return null;
+  const all = px.indices.subarray(start, start + n);
+  const baseFill = opts.fill ?? modelOfList(img, all, opts).fill;
+  const parts: Array<{ indices: Int32Array; fill: Fill }> = [];
+  const visit = (indices: Int32Array, fill: Fill, depth: number): void => {
+    const keep = (): void => void parts.push({ indices, fill });
+    if (depth >= maxDepth || indices.length < 2 * MIN_MODEL_CORE) return keep();
+    const pair = kmeansResidualSplit(img, indices, fill);
+    if (pair === null) return keep();
+    const [a, b] = pair;
+    if (a.length < MIN_MODEL_CORE || b.length < MIN_MODEL_CORE) return keep();
+    const ma = modelOfList(img, a, opts);
+    const mb = modelOfList(img, b, opts);
+    const before = rmseOnList(img, indices, fill);
+    const after = Math.sqrt((a.length * ma.rmse * ma.rmse + b.length * mb.rmse * mb.rmse) / indices.length);
+    if (!(after <= SPLIT_MAX_RMSE_RATIO * before) || !(before - after >= SPLIT_MIN_RMSE_GAIN)) return keep();
+    // A part the ladder still cannot explain is worth another level; one it can is final.
+    if (ma.complex) visit(a, ma.fill, depth + 1);
+    else parts.push({ indices: a, fill: ma.fill });
+    if (mb.complex) visit(b, mb.fill, depth + 1);
+    else parts.push({ indices: b, fill: mb.fill });
+  };
+  visit(all, baseFill, 0);
+  if (parts.length < 2 || parts.length > 255) return null;
+  // assign: both `all` and every part are in raster order, so one merge pass per part places it.
+  const assign = new Uint8Array(n);
+  const fills: Fill[] = [];
+  for (let p = 0; p < parts.length; p++) {
+    fills.push(parts[p].fill);
+    const list = parts[p].indices;
+    let j = 0;
+    for (let i = 0; i < list.length; i++) {
+      while (j < n && all[j] !== list[i]) j++;
+      if (j >= n) throw new RangeError('splitComplex: un píxel de una parte no está en el núcleo de la región');
+      assign[j] = p;
+      j++;
+    }
+  }
+  return { assign, fills };
 }
 
 // ---------------------------------------------------------------------------------------------

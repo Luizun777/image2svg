@@ -12,7 +12,8 @@
  *        background) is emitted as a single rectangular path instead of being traced; with a
  *        transparent background pixels with alpha < 128 belong to no layer.
  * gradient: composite like flat -> box proxy <= 4 Mpx -> noise sigma -> edge segmentation into regions ->
- *        one solid / linear / radial model per region, merged regions re-fitted -> resampleRaster U ->
+ *        one solid / linear / radial model per region, merged regions re-fitted, a region no single fill explains
+ *        split into parts that become regions of their own -> resampleRaster U ->
  *        labels refined at Ux by the models -> painter's order -> one lazy mask per region, the layer
  *        carrying its gradient (see prepareGradient). Too many edges or regions: 16-colour flat palette
  *        with the 'gradient-fallback' warning.
@@ -36,6 +37,7 @@ import type {
   Layer,
   PathStats,
   RasterImage,
+  RegionMap,
   RegionModel,
   ResolvedParams,
   RGB,
@@ -61,9 +63,32 @@ import { detectGrid } from './edges';
 import { analyzeSource, classify, PHOTO_FALLBACK_COLORS, THIN_STROKE_RATIO } from './classify';
 import { applyBakedBackground, detectBakedCheckerboard, effectiveSource } from './bakedBackground';
 import { immerkaerSigma } from './noise';
-import { CORE_MIN_ALPHA, MAX_GRADIENT_REGIONS, NO_REGION, mergeRegions, rankMap, refineLabels, regionMask, regionOrder, segmentEdges, segmentRegions } from './regions';
-import { accumulateMoments, corePixels, extendGradient, planMerges, rmseOf, selectModel, type RegionPixels } from './fillModel';
-import { isDegenerateGradient, scaleGradient } from './fillEval';
+import {
+  CORE_MIN_ALPHA,
+  MAX_GRADIENT_REGIONS,
+  NO_REGION,
+  mergeRegions,
+  rankMap,
+  refineLabels,
+  regionAdjacency,
+  regionMask,
+  regionOrder,
+  segmentEdges,
+  segmentRegions,
+} from './regions';
+import {
+  MIN_MODEL_CORE,
+  SPLIT_MAX_DEPTH,
+  accumulateMoments,
+  corePixels,
+  extendGradient,
+  planMerges,
+  rmseOf,
+  selectModel,
+  splitComplex,
+  type RegionPixels,
+} from './fillModel';
+import { evaluateFill, isDegenerateGradient, scaleGradient } from './fillEval';
 import { assembleSvg } from '../svg/assemble';
 import { gradientMeanHex, rgbToHex } from '../svg/gradients';
 import { pathStats, utf8ByteLength } from '../svg/pathStats';
@@ -492,6 +517,27 @@ export const GRADIENT_FIT_CORE_TOLERANCE = 0.5;
  * flooded smooth ramps; once gated, it is 44 % edge and 91 % complex (see "Decisiones de implementación").
  */
 export const GRADIENT_MAX_COMPLEX_SHARE = 0.5;
+/**
+ * Majority-smoothing passes over the part labels of a split region (splitComplexRegions). The k-means boundary and the
+ * per-pixel decision of the band are ragged, and the tracer pays for every wiggle of an outline.
+ */
+export const GRADIENT_SPLIT_SMOOTH_PASSES = 4;
+/**
+ * Smallest 4-connected piece of a part the split may leave behind (proxy px, absorbIslands): a piece under
+ * MIN_MODEL_CORE could never carry a model of its own, so it cannot justify a traced subpath of its own either.
+ * Measured: the islands the belly of pajaro left are 25, 19, 16, 8, 8, 7, 2 and 7 proxy px against parts of 5562, 5895
+ * and 10307, and the smallest parts the split produces anywhere measured (the shadingGrid fixture) are 169-186 px, so 64
+ * separates them with room on both sides while 128 would start absorbing that fixture's parts.
+ */
+export const GRADIENT_SPLIT_MIN_ISLAND = MIN_MODEL_CORE;
+/**
+ * Budget of the split: it may add at most max(2^SPLIT_MAX_DEPTH - 1, ceil(share · regions)) regions to the image, so one
+ * region can always be split to the full depth, and an image made of many 2-D shadings cannot multiply its region count
+ * (and with it its masks, potrace calls, <linearGradient> elements, nodes and bytes) by up to 2^SPLIT_MAX_DEPTH. The
+ * largest complex regions go first, which is where the error is. Measured on the shadingGrid fixture ("Decisiones de
+ * implementación").
+ */
+export const GRADIENT_SPLIT_MAX_NEW_SHARE = 0.25;
 
 /** Proxy factor of gradient mode: f = ceil(sqrt(W·H / GRADIENT_PROXY_AREA)), at least 1. */
 export function gradientProxyFactor(width: number, height: number): number {
@@ -521,6 +567,8 @@ export type GradientFit =
       rawRegions: number;
       /** Merge rounds that found pairs (0..GRADIENT_MERGE_ROUNDS). */
       mergeRounds: number;
+      /** Complex regions splitComplex broke into parts (0 when none was, or none was worth it). */
+      splitRegions: number;
     };
 
 /** Deep band of every region of `seg` (see GRADIENT_FIT_DEPTH), core pixels included: 1 = in the band. */
@@ -574,7 +622,7 @@ function deepBand(seg: Segmentation, img: RasterImage, depth: number): Uint8Arra
   return band;
 }
 
-interface FittedRegions {
+export interface FittedRegions {
   /** `seg` with core = the fit core: the core, plus the deep band of every region fitted on it. */
   fitSeg: Segmentation;
   px: RegionPixels;
@@ -653,6 +701,376 @@ function fitRegionModels(
 }
 
 /**
+ * Majority smoothing of the part labels of the split regions, in place on `part` and only over the window
+ * [wx0, wx1] × [wy0, wy1] (every pixel of every split region): GRADIENT_SPLIT_SMOOTH_PASSES passes, each moving a
+ * pixel to the part that strictly most of its 8 neighbours INSIDE the same region belong to (a tie keeps the pixel
+ * where it is), read from a snapshot of the previous pass so the outcome never depends on the scan order. The
+ * k-means decides per pixel on a residual, and along the band so does the fill comparison, so both boundaries come
+ * out ragged and the tracer pays a node for every wiggle. A region whose parts would be left with fewer than
+ * MIN_MODEL_CORE fit-core pixels keeps its unsmoothed labels instead: every part must still earn a model of its own.
+ * The vote alone does not tidy everything: a blob along the region's outline has few or no voters (only neighbours of
+ * the same ORIGINAL region count) and survives every pass, which is what absorbIslands is for.
+ *
+ * `base` indexes the parts: region k owns the slots base[k] .. base[k+1], and base[k+1] === base[k] when it was not
+ * split (then part[i] is 0 everywhere in it, i.e. the region itself).
+ */
+function smoothParts(
+  lab: Int32Array,
+  part: Int32Array,
+  base: Int32Array,
+  W: number,
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number,
+  fitCore: Uint8Array,
+): void {
+  if (GRADIENT_SPLIT_SMOOTH_PASSES <= 0 || wx1 < wx0) return;
+  const ww = wx1 - wx0 + 1;
+  const wh = wy1 - wy0 + 1;
+  const unsmoothed = new Int32Array(ww * wh);
+  for (let y = wy0; y <= wy1; y++) {
+    const row = y * W + wx0;
+    unsmoothed.set(part.subarray(row, row + ww), (y - wy0) * ww);
+  }
+  const prev = new Int32Array(ww * wh);
+  const counts = new Int32Array(256);
+  for (let pass = 0; pass < GRADIENT_SPLIT_SMOOTH_PASSES; pass++) {
+    for (let y = wy0; y <= wy1; y++) {
+      const row = y * W + wx0;
+      prev.set(part.subarray(row, row + ww), (y - wy0) * ww);
+    }
+    for (let y = wy0; y <= wy1; y++) {
+      for (let x = wx0; x <= wx1; x++) {
+        const i = y * W + x;
+        const k = lab[i];
+        if (k < 0) continue;
+        const m = base[k + 1] - base[k];
+        if (m === 0) continue;
+        counts.fill(0, 0, m);
+        for (let dy = -1; dy <= 1; dy++) {
+          const yy = y + dy;
+          if (yy < wy0 || yy > wy1) continue;
+          for (let dx = -1; dx <= 1; dx++) {
+            const xx = x + dx;
+            if ((dx === 0 && dy === 0) || xx < wx0 || xx > wx1) continue;
+            if (lab[yy * W + xx] !== k) continue;
+            counts[prev[(yy - wy0) * ww + (xx - wx0)]]++;
+          }
+        }
+        const own = prev[(y - wy0) * ww + (x - wx0)];
+        let best = 0;
+        for (let p = 1; p < m; p++) if (counts[p] > counts[best]) best = p;
+        if (counts[best] > counts[own]) part[i] = best;
+      }
+    }
+  }
+  const core = new Int32Array(base[base.length - 1]);
+  for (let y = wy0; y <= wy1; y++) {
+    for (let x = wx0; x <= wx1; x++) {
+      const i = y * W + x;
+      const k = lab[i];
+      if (k < 0 || base[k + 1] === base[k] || fitCore[i] === 0) continue;
+      core[base[k] + part[i]]++;
+    }
+  }
+  const revert = new Uint8Array(base.length - 1);
+  let any = false;
+  for (let k = 0; k + 1 < base.length; k++) {
+    for (let p = base[k]; p < base[k + 1]; p++) {
+      if (core[p] >= MIN_MODEL_CORE) continue;
+      revert[k] = 1;
+      any = true;
+    }
+  }
+  if (!any) return;
+  for (let y = wy0; y <= wy1; y++) {
+    for (let x = wx0; x <= wx1; x++) {
+      const i = y * W + x;
+      const k = lab[i];
+      if (k >= 0 && revert[k] !== 0) part[i] = unsmoothed[(y - wy0) * ww + (x - wx0)];
+    }
+  }
+}
+
+/**
+ * Connected-component cleanup of the part labels, in place on `part` over the same window: every 4-connected piece of a
+ * part smaller than GRADIENT_SPLIT_MIN_ISLAND proxy px that touches a piece of at least that size of ANOTHER part of the
+ * same region moves to the part of most of those neighbouring pixels (a tie goes to the lowest part index). The k-means
+ * assigns a core pixel on a residual and the band pixel by pixel on its fill, so both leave islands, and the majority
+ * vote of smoothParts cannot reach the ones along the region's outline (no voters there): the tracer then emits a
+ * subpath per island, painted from a different part's gradient than its surroundings. Every island of the round is moved
+ * at once (the vote only counts pieces that are NOT being moved, so two islands cannot swap parts), and the rounds
+ * repeat while one moves: a move joins two pieces, so their number strictly drops and it ends. A piece with no bigger
+ * neighbouring piece of another part is left alone: the region itself is disconnected there, which the segmentation
+ * already allows and no relabelling inside the region can fix.
+ */
+function absorbIslands(
+  lab: Int32Array,
+  part: Int32Array,
+  base: Int32Array,
+  W: number,
+  wx0: number,
+  wy0: number,
+  wx1: number,
+  wy1: number,
+): void {
+  if (GRADIENT_SPLIT_MIN_ISLAND <= 1 || wx1 < wx0) return;
+  const ww = wx1 - wx0 + 1;
+  const wh = wy1 - wy0 + 1;
+  const comp = new Int32Array(ww * wh);
+  const stack: number[] = [];
+  for (;;) {
+    comp.fill(-1);
+    const size: number[] = [];
+    const first: number[] = [];
+    for (let y = wy0; y <= wy1; y++) {
+      for (let x = wx0; x <= wx1; x++) {
+        const w0 = (y - wy0) * ww + (x - wx0);
+        if (comp[w0] >= 0) continue;
+        const i0 = y * W + x;
+        const k = lab[i0];
+        if (k < 0 || base[k + 1] === base[k]) continue;
+        const p = part[i0];
+        const id = size.length;
+        size.push(0);
+        first.push(i0);
+        comp[w0] = id;
+        stack.push(w0);
+        while (stack.length > 0) {
+          const q = stack.pop() as number;
+          size[id]++;
+          const qx = q % ww;
+          const qy = (q - qx) / ww;
+          const qi = (qy + wy0) * W + (qx + wx0);
+          for (let s = 0; s < 4; s++) {
+            const nx = qx + (s === 0 ? -1 : s === 1 ? 1 : 0);
+            const ny = qy + (s === 2 ? -1 : s === 3 ? 1 : 0);
+            if (nx < 0 || ny < 0 || nx >= ww || ny >= wh) continue;
+            const w2 = ny * ww + nx;
+            if (comp[w2] >= 0) continue;
+            const i2 = qi + (s === 0 ? -1 : s === 1 ? 1 : s === 2 ? -W : W);
+            if (lab[i2] !== k || part[i2] !== p) continue;
+            comp[w2] = id;
+            stack.push(w2);
+          }
+        }
+      }
+    }
+    // The islands of this round, smallest first (tie: its first pixel in raster order), and a tally per part for each.
+    const slot = new Int32Array(size.length).fill(-1);
+    const order: number[] = [];
+    for (let id = 0; id < size.length; id++) {
+      if (size[id] >= GRADIENT_SPLIT_MIN_ISLAND) continue;
+      slot[id] = order.length;
+      order.push(id);
+    }
+    if (order.length === 0) return;
+    order.sort((a, b) => size[a] - size[b] || first[a] - first[b]);
+    const tally = order.map(() => new Int32Array(0));
+    for (const id of order) {
+      const k = lab[first[id]];
+      tally[slot[id]] = new Int32Array(base[k + 1] - base[k]);
+    }
+    for (let y = wy0; y <= wy1; y++) {
+      for (let x = wx0; x <= wx1; x++) {
+        const w0 = (y - wy0) * ww + (x - wx0);
+        const id = comp[w0];
+        if (id < 0 || slot[id] < 0) continue;
+        const i0 = y * W + x;
+        const k = lab[i0];
+        const p = part[i0];
+        const counts = tally[slot[id]];
+        for (let s = 0; s < 4; s++) {
+          const nx = x + (s === 0 ? -1 : s === 1 ? 1 : 0);
+          const ny = y + (s === 2 ? -1 : s === 3 ? 1 : 0);
+          if (nx < wx0 || ny < wy0 || nx > wx1 || ny > wy1) continue;
+          const i2 = i0 + (s === 0 ? -1 : s === 1 ? 1 : s === 2 ? -W : W);
+          if (lab[i2] !== k) continue;
+          const q = part[i2];
+          if (q === p || slot[comp[(ny - wy0) * ww + (nx - wx0)]] >= 0) continue;
+          counts[q]++;
+        }
+      }
+    }
+    const target = new Int32Array(size.length).fill(-1);
+    let moves = 0;
+    for (const id of order) {
+      const counts = tally[slot[id]];
+      let best = -1;
+      for (let p = 0; p < counts.length; p++) if (counts[p] > 0 && (best < 0 || counts[p] > counts[best])) best = p;
+      if (best < 0) continue;
+      target[id] = best;
+      moves++;
+    }
+    if (moves === 0) return;
+    for (let y = wy0; y <= wy1; y++) {
+      for (let x = wx0; x <= wx1; x++) {
+        const id = comp[(y - wy0) * ww + (x - wx0)];
+        if (id >= 0 && target[id] >= 0) part[y * W + x] = target[id];
+      }
+    }
+  }
+}
+
+/**
+ * The parts of every complex region of `seg` materialised as real regions, so that everything downstream
+ * (regionOrder, refineLabels, rankMap, regionMask, the layers) works unchanged: splitComplex on the fit core of each
+ * complex region, by descending area (the ones that matter most first, id as tie-break) and only while the regions the
+ * split adds fit both the GRADIENT_SPLIT_MAX_NEW_SHARE budget and MAX_GRADIENT_REGIONS; part 0 keeps the region's id
+ * and the other parts get new ones after the last region.
+ *
+ * The split must cover EVERY pixel of the region, not only the core the k-means saw: a pixel of the region outside
+ * the fit core (the edge band) goes to the part whose fitted fill predicts it best (squared RGB error), which is the
+ * criterion refineLabels uses at Ux, so the proxy labels and the Ux refinement agree instead of disagreeing along the
+ * seam (by nearest part instead, a band pixel could land in a part whose ramp never reaches it). Both boundaries are
+ * then tidied: smoothParts votes them smooth and absorbIslands absorbs the pieces the vote leaves behind.
+ *
+ * Last gate, on the final labels: every part needs MIN_MODEL_CORE pixels of the TRUE core, because that is what
+ * fitRegionModels fits its model on (the guarantees inside splitComplex and smoothParts count the FIT core, core ∪ deep
+ * band, which is bigger); a region with a part under it is not split at all. area and adjacency are rebuilt for the new
+ * labels; core, edge, sigma and edgeShare are unchanged: the core mask is per pixel, so a core pixel of the old region
+ * is a core pixel of whichever part took it. The parts are then fitted exactly like the regions a merge round creates
+ * (fitRegionModels, the untouched regions keeping their model), so every model comes from its final pixel set and the
+ * deep-band rule applies to the parts too. Returns null when nothing was split.
+ *
+ * Exported for the tests: they hand it a Segmentation whose true core is deliberately sparser than the fit core, and
+ * one whose k-means leaves islands, which no sample reaches on its own.
+ */
+export function splitComplexRegions(
+  proxy: RasterImage,
+  seg: Segmentation,
+  fitted: FittedRegions,
+  fitOpts: { sigma: number; maxStops: number; radial: boolean },
+): { fitted: FittedRegions; splitRegions: number } | null {
+  const count = seg.regions.count;
+  const models = fitted.models;
+  const px = fitted.px;
+  const todo: number[] = [];
+  for (let k = 0; k < count; k++) if (models[k].complex) todo.push(k);
+  if (todo.length === 0) return null;
+  todo.sort((a, b) => seg.area[b] - seg.area[a] || a - b);
+
+  const W = seg.regions.width;
+  const H = seg.regions.height;
+  const lab = seg.regions.data;
+  const part = new Int32Array(lab.length);
+  const fills: Array<Fill[] | null> = Array.from({ length: count }, () => null);
+  const budget = Math.max(2 ** SPLIT_MAX_DEPTH - 1, Math.ceil(GRADIENT_SPLIT_MAX_NEW_SHARE * count));
+  let added = 0;
+  for (const k of todo) {
+    if (added >= budget) break; // every split adds at least one region
+    const split = splitComplex(proxy, px, k, { ...fitOpts, fill: models[k].fill });
+    if (split === null) continue;
+    const m = split.fills.length;
+    // Descending area, so a region whose parts do not fit what is left of the budget can still be followed by a
+    // smaller one that does (MAX_GRADIENT_REGIONS is the absolute ceiling behind the per-image budget).
+    if (added + m - 1 > budget || count + added + m - 1 > MAX_GRADIENT_REGIONS) continue;
+    fills[k] = split.fills;
+    added += m - 1;
+    const start = px.offsets[k];
+    for (let i = 0; i < split.assign.length; i++) part[px.indices[start + i]] = split.assign[i];
+  }
+  if (added === 0) return null;
+  const base = new Int32Array(count + 1);
+  for (let k = 0; k < count; k++) {
+    const f = fills[k];
+    base[k + 1] = base[k] + (f === null ? 0 : f.length);
+  }
+
+  const fitCore = fitted.fitSeg.core.data;
+  const d = proxy.data;
+  const c: RGB = [0, 0, 0];
+  // Window of every split region (core and band), so the passes below only sweep what they can change.
+  let wx0 = W;
+  let wy0 = H;
+  let wx1 = -1;
+  let wy1 = -1;
+  for (let i = 0; i < lab.length; i++) {
+    const k = lab[i];
+    if (k < 0) continue;
+    const f = fills[k];
+    if (f === null) continue;
+    const x = i % W;
+    const y = (i - x) / W;
+    if (x < wx0) wx0 = x;
+    if (x > wx1) wx1 = x;
+    if (y < wy0) wy0 = y;
+    if (y > wy1) wy1 = y;
+    if (fitCore[i] !== 0) continue;
+    const cx = x + 0.5;
+    const cy = y + 0.5;
+    const o = i * 4;
+    let best = 0;
+    let bestErr = Infinity;
+    for (let p = 0; p < f.length; p++) {
+      evaluateFill(f[p], cx, cy, c);
+      const err = (d[o] - c[0]) ** 2 + (d[o + 1] - c[1]) ** 2 + (d[o + 2] - c[2]) ** 2;
+      if (err < bestErr) {
+        bestErr = err;
+        best = p;
+      }
+    }
+    part[i] = best;
+  }
+  smoothParts(lab, part, base, W, wx0, wy0, wx1, wy1, fitCore);
+  absorbIslands(lab, part, base, W, wx0, wy0, wx1, wy1);
+
+  const trueCore = seg.core.data;
+  const coreCount = new Int32Array(base[count]);
+  for (let y = wy0; y <= wy1; y++) {
+    for (let x = wx0; x <= wx1; x++) {
+      const i = y * W + x;
+      const k = lab[i];
+      if (k < 0 || base[k + 1] === base[k] || trueCore[i] === 0) continue;
+      coreCount[base[k] + part[i]]++;
+    }
+  }
+  const ids: Array<Int32Array | null> = Array.from({ length: count }, () => null);
+  let next = count;
+  let splitRegions = 0;
+  for (let k = 0; k < count; k++) {
+    const m = base[k + 1] - base[k];
+    if (m === 0) continue;
+    let ok = true;
+    for (let p = 0; p < m; p++) if (coreCount[base[k] + p] < MIN_MODEL_CORE) ok = false;
+    if (!ok) continue; // the region keeps its id on every one of its pixels, and its model
+    const list = new Int32Array(m);
+    list[0] = k;
+    for (let p = 1; p < m; p++) list[p] = next++;
+    ids[k] = list;
+    splitRegions++;
+  }
+  if (splitRegions === 0) return null;
+  const data = Int32Array.from(lab);
+  for (let y = wy0; y <= wy1; y++) {
+    for (let x = wx0; x <= wx1; x++) {
+      const i = y * W + x;
+      const k = lab[i];
+      if (k < 0) continue;
+      const list = ids[k];
+      if (list !== null) data[i] = list[part[i]];
+    }
+  }
+
+  const regions: RegionMap = { data, width: W, height: H, count: next };
+  const area = new Float64Array(next);
+  for (let i = 0; i < data.length; i++) if (data[i] >= 0) area[data[i]]++;
+  const newSeg: Segmentation = {
+    regions,
+    edge: seg.edge,
+    core: seg.core,
+    area,
+    adjacency: regionAdjacency(regions),
+    sigma: seg.sigma,
+    edgeShare: seg.edgeShare,
+  };
+  const known: Array<{ model: RegionModel; deep: number } | null> = [];
+  for (let k = 0; k < next; k++) known.push(k < count && ids[k] === null ? { model: models[k], deep: fitted.deep[k] } : null);
+  return { fitted: fitRegionModels(proxy, newSeg, fitOpts, known), splitRegions };
+}
+
+/**
  * Segments and fits gradient mode on `img` (the traced source): background as flat (resolveBackground; transparent
  * -> not composited) -> proxy (downscaleBoxRaster by gradientProxyFactor, on premultiplied colour when transparent)
  * -> sigma = immerkaerSigma(proxy) -> segmentEdges; fallback when edgeShare > GRADIENT_MAX_EDGE_SHARE, before any
@@ -660,9 +1078,11 @@ function fitRegionModels(
  * regions. Otherwise selectModel per region (maxStops,
  * radial = radialGradients) on its core, or on its core ∪ deep band when the core no longer spans it
  * (GRADIENT_FIT_MIN_CORE_SHARE), and up to GRADIENT_MERGE_ROUNDS rounds of planMerges -> mergeRegions, re-fitting
- * every region made of more than one old region (the others keep their model). splitComplex does not exist yet: a
- * complex region keeps the lowest-RMSE candidate selectModel returns; above GRADIENT_MAX_COMPLEX_SHARE of the labelled
- * area in complex regions, fallback. Last, every gradient is extended over its region's deep band (extendModels).
+ * every region made of more than one old region (the others keep their model). Above GRADIENT_MAX_COMPLEX_SHARE of the
+ * labelled area in complex regions, fallback; below it, the complex regions left (a 2-D shading no single gradient
+ * expresses) are split into parts with their own fills and materialised as regions (splitComplexRegions), and a part
+ * that still comes out complex keeps the lowest-RMSE candidate selectModel returns. Last, every gradient is extended
+ * over its region's deep band (extendModels).
  */
 export function fitGradientRegions(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): GradientFit {
   assertImage(img, 'fitGradientRegions');
@@ -716,12 +1136,20 @@ export function fitGradientRegions(img: RasterImage, resolved: ResolvedParams, i
     seg = merged;
     fitted = fitRegionModels(proxy, seg, fitOpts, known);
   }
+  const late = complexFallback(fitted.fitSeg.area, fitted.models);
+  if (late !== null) return late;
+  // The fallback comes first on purpose: an image that is mostly complex is not flat art, and splitting its regions
+  // would not make it so (splash and Instagram forced to gradient). Below the limit, the complex regions are split.
+  let splitRegions = 0;
+  const split = splitComplexRegions(proxy, seg, fitted, fitOpts);
+  if (split !== null) {
+    fitted = split.fitted;
+    splitRegions = split.splitRegions;
+  }
   const models = fitted.models;
   seg = fitted.fitSeg;
-  const late = complexFallback(seg.area, models);
-  if (late !== null) return late;
   extendModels(proxy, seg, models, fitted.px);
-  return { kind: 'regions', base, transparent, f, sigma, seg, models, rawRegions, mergeRounds };
+  return { kind: 'regions', base, transparent, f, sigma, seg, models, rawRegions, mergeRounds, splitRegions };
 }
 
 /** The complex-share fallback: above GRADIENT_MAX_COMPLEX_SHARE of the labelled area in complex regions, null otherwise. */

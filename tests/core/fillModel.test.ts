@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import type { BinaryMask, Gradient, LinearGradient, RasterImage, RegionMap, RegionModel, RGB, Segmentation } from '../../src/types';
+import type { BinaryMask, Fill, Gradient, LinearGradient, RasterImage, RegionMap, RegionModel, RGB, Segmentation } from '../../src/types';
 import { diagonalSweep, flatShapes3, gradientFeathers, hueRamp, radialDisc, withNoise } from '../../src/dev/synth';
 import { evaluateFill, isDegenerateGradient } from '../../src/core/fillEval';
 import {
@@ -20,7 +20,9 @@ import {
   M_Y,
   M_YY,
   MERGE_MAX_JOINT_PIXELS,
+  MIN_MODEL_CORE,
   MOMENTS_PER_REGION,
+  SPLIT_MAX_DEPTH,
   accumulateMoments,
   corePixels,
   fitFlat,
@@ -656,10 +658,114 @@ describe('planMerges', () => {
   });
 });
 
+/**
+ * One region holding two shadings at once, like pajaro's belly: the top half ramps one way across the image and the
+ * bottom half ramps back the other way. The two gradients cancel, so planeAxis finds no axis at all and the best
+ * single fill the whole ladder can offer is a flat colour (measured RMSE 39.6), and no number of stops helps: a
+ * ramp is a function of one projection and this region needs two. Each half on its own is an exact 150-level ramp, so
+ * the parts a split finds fit to a fraction of a level and none of them is flat enough for a solid fill.
+ */
+function twoAxisHalves(w = 128, h = 96): RasterImage {
+  return rasterOf(w, h, (x, y) => {
+    const u = (x + 0.5) / w;
+    return 2 * y < h ? [40 + 150 * u, 50 + 140 * u, 70 + 120 * u] : [190 - 150 * u, 190 - 140 * u, 190 - 120 * u];
+  });
+}
+
+/**
+ * The limit of the split, measured: a VERTICAL seam whose halves ramp along x and along y is not split at all. The two
+ * halves sit at disjoint parameters of the fitted x-ramp, so its stops follow each half on its own and the only thing
+ * left unexplained is the y variation, which no cut across the axis separates by half.
+ */
+function perpendicularHalves(w = 128, h = 96): RasterImage {
+  return rasterOf(w, h, (x, y) => {
+    const u = (2 * (x + 0.5)) / w;
+    const v = (y + 0.5) / h;
+    return 2 * x < w ? [40 + 100 * u, 55 + 100 * u, 70 + 100 * u] : [40 + 100 * v, 55 + 100 * v, 70 + 100 * v];
+  });
+}
+
+/** Pooled RMSE of `fill` over an explicit pixel list. */
+function rmseOnPixels(img: RasterImage, list: readonly number[], fill: Fill): number {
+  return rmseOf(img, { offsets: Int32Array.from([0, list.length]), indices: Int32Array.from(list) }, 0, fill);
+}
+
+/** The core pixels of region `id`, grouped by the part splitComplex put them in. */
+function groupsOf(px: RegionPixels, id: number, assign: Uint8Array, parts: number): number[][] {
+  const out: number[][] = Array.from({ length: parts }, () => []);
+  for (let i = 0; i < assign.length; i++) out[assign[i]].push(px.indices[px.offsets[id] + i]);
+  return out;
+}
+
 describe('splitComplex', () => {
-  it('is not implemented in this version: always null, a complex region keeps its best candidate', () => {
+  it('splits a region two shadings share, and every part comes out under RMSE 2 inside one half', () => {
+    const img = twoAxisHalves();
+    const fit = fitAll(img, singleRegion(128, 96), { sigma: 0 });
+    const whole = fit.models[0];
+    expect(whole.complex).toBe(true);
+    expect(whole.fill.kind).toBe('solid'); // the halves' gradients cancel: no axis left to fit
+    expect(whole.rmse).toBeGreaterThan(6);
+    const split = splitComplex(img, fit.px, 0, { sigma: 0, maxStops: 8, fill: whole.fill });
+    expect(split).not.toBeNull();
+    if (split === null) throw new Error('unreachable');
+    // The cut runs across the fitted axis, so a half comes back as one or two parts, never mixed with the other.
+    expect(split.fills.length).toBeGreaterThanOrEqual(2);
+    expect(split.fills.length).toBeLessThanOrEqual(2 ** SPLIT_MAX_DEPTH);
+    const groups = groupsOf(fit.px, 0, split.assign, split.fills.length);
+    const rmses = groups.map((g, p) => rmseOnPixels(img, g, split.fills[p]));
+    const topShare = groups.map((g) => g.filter((p) => 2 * Math.floor(p / 128) < 96).length / g.length);
+    console.info(
+      `twoAxisHalves: whole ${whole.fill.kind} rmse ${whole.rmse.toFixed(2)} (flat ${whole.rmseFlat.toFixed(2)}) -> ` +
+        groups.map((g, p) => `${split.fills[p].kind} ${g.length} px rmse ${rmses[p].toFixed(2)}`).join(', '),
+    );
+    for (let p = 0; p < groups.length; p++) {
+      expect(rmses[p], `part ${p}`).toBeLessThan(2);
+      expect(split.fills[p].kind, `part ${p}`).not.toBe('solid'); // every part still needs a gradient of its own
+      expect(groups[p].length, `part ${p}`).toBeGreaterThanOrEqual(MIN_MODEL_CORE);
+      // No part straddles the seam: at least 98 % of its pixels in one half.
+      expect(Math.max(topShare[p], 1 - topShare[p]), `part ${p}`).toBeGreaterThanOrEqual(0.98);
+    }
+    expect(topShare.some((s) => s > 0.5), 'the top half is recovered').toBe(true);
+    expect(topShare.some((s) => s < 0.5), 'the bottom half is recovered').toBe(true);
+    // Every core pixel of the region belongs to exactly one part.
+    expect(groups.reduce((n, g) => n + g.length, 0)).toBe(fit.px.offsets[1] - fit.px.offsets[0]);
+  });
+
+  it('is deterministic, and maxDepth bounds the parts (0 never splits)', () => {
+    const img = twoAxisHalves();
+    const fit = fitAll(img, singleRegion(128, 96), { sigma: 0 });
+    const opts = { sigma: 0, maxStops: 8, fill: fit.models[0].fill };
+    const a = splitComplex(img, fit.px, 0, opts);
+    const b = splitComplex(img, fit.px, 0, opts);
+    expect(a).not.toBeNull();
+    expect(JSON.stringify(b)).toBe(JSON.stringify(a));
+    expect((a?.fills ?? []).length).toBeLessThanOrEqual(2 ** SPLIT_MAX_DEPTH);
+    expect(splitComplex(img, fit.px, 0, { ...opts, maxDepth: 0 })).toBeNull();
+  });
+
+  it('returns null for what one fill already explains and for a region too small for two models', () => {
+    // A clean single ramp: the parts could only trade the noise floor, far from SPLIT_MIN_RMSE_GAIN.
+    const hr = hueRamp(96);
+    const fitHr = fitAll(hr.image, singleRegion(96, 96), { sigma: 0 });
+    expect(fitHr.models[0].complex).toBe(false);
+    expect(splitComplex(hr.image, fitHr.px, 0, { sigma: 0, maxStops: 8, fill: fitHr.models[0].fill })).toBeNull();
+    // Flat art: a complex region keeps its best candidate, as before splitComplex existed.
     const fs = flatShapes3(48);
     const seg = segFromLabels(fs.image, regionMapFromLabelMap(fs.labels));
     expect(splitComplex(fs.image, corePixels(seg), 0, { sigma: 0, maxStops: 8 })).toBeNull();
+    // The same two shadings on 12 × 10 px: 120 core pixels, under 2 · MIN_MODEL_CORE.
+    const small = twoAxisHalves(12, 10);
+    const fitSmall = fitAll(small, singleRegion(12, 10), { sigma: 0 });
+    expect(fitSmall.px.offsets[1]).toBeLessThan(2 * MIN_MODEL_CORE);
+    expect(splitComplex(small, fitSmall.px, 0, { sigma: 0, maxStops: 8 })).toBeNull();
+  });
+
+  it('leaves a vertical seam with perpendicular axes alone (the measured limit of the split)', () => {
+    // Not a goal, a recorded limit: the halves sit at disjoint parameters of the fitted ramp, whose stops then follow
+    // each of them, so no cut across that axis separates the halves and none earns SPLIT_MIN_RMSE_GAIN.
+    const img = perpendicularHalves();
+    const fit = fitAll(img, singleRegion(128, 96), { sigma: 0 });
+    expect(fit.models[0].complex).toBe(true);
+    expect(splitComplex(img, fit.px, 0, { sigma: 0, maxStops: 8, fill: fit.models[0].fill })).toBeNull();
   });
 });

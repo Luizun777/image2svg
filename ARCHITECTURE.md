@@ -314,7 +314,8 @@ export const M_N = 0, M_X = 1, M_Y = 2, M_XX = 3, M_XY = 4, M_YY = 5, M_R = 6, M
 // RADIAL_MAX_SAMPLES 8192, RADIAL_MIN_SAMPLES 16, RADIAL_MIN_GRADIENT 0.05, RADIAL_MIN_CONDITION 0.05, RADIAL_MIN_RADIUS 2,
 // RADIAL_MONOTONE_EPS_FACTOR 2; MERGE_MIN_AREA_FLOOR 16, MERGE_MIN_AREA_SHARE 2e-5, MERGE_MAX_RMSE_GAIN 1.5, MERGE_MAX_BOUNDARY_JUMP 3,
 // MERGE_MAX_AXIS_DEG 15, MERGE_MAX_JOINT_PIXELS 32768, MERGE_MAX_BOUNDARY_SAMPLES 4096; MICRO_PER_BIN 16, PRUNE_MAX_RMSE_LOSS 0.05;
-// FLAT_END_TOL_FACTOR 2, MERGE_SMALL_MAX_OFFSET 24 (revisión de hallazgos).
+// FLAT_END_TOL_FACTOR 2, MERGE_SMALL_MAX_OFFSET 24 (revisión de hallazgos); SPLIT_KMEANS_ITERATIONS 12, SPLIT_MAX_RMSE_RATIO 0.8,
+// SPLIT_MIN_RMSE_GAIN 1.5, SPLIT_MAX_DEPTH 2 (división de regiones complejas).
 export function accumulateMoments(img: RasterImage, seg: Segmentation): Float64Array   // longitud 16·count; una pasada
 export interface RegionPixels { offsets: Int32Array; indices: Int32Array }
 export function corePixels(seg: Segmentation): RegionPixels
@@ -370,9 +371,18 @@ export function extendGradient(img: RasterImage, fill: Gradient, pixels: Int32Ar
 // RAMP_TRIM uLo, uHi: un lineal con uLo < 0 o uHi > 1 lleva sus extremos a esos cuantiles y un radial con uHi > 1 pasa a r·uHi (el centro
 // queda), con los offsets reescalados y la primera y la última parada movidas hacia fuera sobre sus segmentos (color extrapolado y recortado a
 // [0, 255]); mismo número de paradas. Se devuelve solo si su RMSE sobre `pixels` es menor; si no, el mismo objeto.
-export function splitComplex(img: RasterImage, px: RegionPixels, id: number, opts: FitOptions): { assign: Uint8Array; fills: Fill[] } | null
-// NO implementada: devuelve siempre null y una región complex conserva su mejor candidato (selectModel). Contrato previsto: 2..4 subgrupos
-// (median cut sobre x, y y residuo); assign[i] = subgrupo del i-ésimo píxel core de id (orden de px); el pipeline crearía las subregiones.
+export function splitComplex(img: RasterImage, px: RegionPixels, id: number, opts: FitOptions & { radial?: boolean; fill?: Fill; maxDepth?: number }): { assign: Uint8Array; fills: Fill[] } | null
+// Parte una región que ningún relleno explica (complex) en 2..2^maxDepth partes con su propio relleno; cifras en Decisiones, "Degradados,
+// división de regiones complejas". Un nivel = k-means determinista con k = 2 sobre (x, y, residuo de luma CON SIGNO del relleno actual), los
+// tres rasgos escalados a [0, 1] (x e y por la caja de la región, el residuo por su rango) para que geometría y error de color pesen igual,
+// sembrado en los píxeles de residuo máximo y mínimo (empate: el índice menor), con ≤ SPLIT_KMEANS_ITERATIONS pasadas y parada en cuanto
+// ningún píxel cambia de grupo (empate de distancia: el primer grupo); luego selectModel en cada parte, que puede salir sólida, lineal o
+// radial. El nivel se acepta solo si las dos partes tienen ≥ MIN_MODEL_CORE píxeles de núcleo Y el RMSE ponderado por núcleo de las dos baja
+// a ≤ SPLIT_MAX_RMSE_RATIO del de la región Y al menos SPLIT_MIN_RMSE_GAIN niveles por debajo; si no, esa rama se queda entera. Una parte que
+// la escalera sigue llamando complex se parte otra vez, hasta maxDepth niveles (defecto SPLIT_MAX_DEPTH). null si no se partió nada.
+// px = los píxeles de núcleo (corePixels, o el núcleo de ajuste del pipeline); opts.fill = el mejor relleno actual de la región (sin él lo
+// ajusta). assign[i] = la parte del i-ésimo píxel de núcleo de id, en el orden de px; fills[p] = el relleno de la parte p. Los píxeles de la
+// región que NO son núcleo (la banda) no están en px: los reparte quien llama (el pipeline, a la parte que mejor los predice).
 ```
 
 ### src/core/classify.ts
@@ -443,13 +453,20 @@ export const GRADIENT_FIT_DEPTH = 1               // banda profunda: píxeles co
 export const GRADIENT_FIT_MIN_CORE_SHARE = 0.5    // núcleo < 0.5·|núcleo ∪ banda profunda| → se ajusta también sobre la unión
 export const GRADIENT_FIT_CORE_TOLERANCE = 0.5    // la unión gana si no se vuelve compleja y su RMSE sobre el núcleo ≤ el del núcleo + 0.5
 export const GRADIENT_MAX_COMPLEX_SHARE = 0.5     // regiones complex por encima de esta fracción del área etiquetada → fallback (revisión)
+export const GRADIENT_SPLIT_SMOOTH_PASSES = 4     // pasadas de mayoría sobre las etiquetas de las partes de una región dividida (división)
+export const GRADIENT_SPLIT_MIN_ISLAND = MIN_MODEL_CORE   // 64: trozo 4-conexo más pequeño que el split deja de una parte (px del proxy); por debajo se absorbe
+export const GRADIENT_SPLIT_MAX_NEW_SHARE = 0.25  // presupuesto: el split añade ≤ max(2^SPLIT_MAX_DEPTH − 1, ceil(0.25·regiones)) regiones a la imagen
 export function gradientProxyFactor(width: number, height: number): number   // f = max(1, ceil(sqrt(W·H / GRADIENT_PROXY_AREA)))
 export type GradientFit =
   | { kind: 'fallback'; reason: string }          // reason en español, minúscula inicial, sin punto final
-  | { kind: 'regions'; base: RasterImage; transparent: boolean; f: number; sigma: number; seg: Segmentation; models: RegionModel[]; rawRegions: number; mergeRounds: number }
+  | { kind: 'regions'; base: RasterImage; transparent: boolean; f: number; sigma: number; seg: Segmentation; models: RegionModel[]; rawRegions: number; mergeRounds: number; splitRegions: number }
 // seg y models en unidades del proxy (seg.core = núcleo de ajuste: núcleo ∪ banda profunda de las regiones ajustadas sobre ella); base = fuente
 // compuesta sobre el fondo resuelto (la fuente misma si es transparente). No depende de U, desenfoque ni capas: el tuner lo memoiza.
 export function fitGradientRegions(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): GradientFit
+export interface FittedRegions { fitSeg: Segmentation; px: RegionPixels; models: RegionModel[]; deep: Uint8Array }   // deep[k] = 1: ajustada sobre núcleo ∪ banda profunda
+export function splitComplexRegions(proxy: RasterImage, seg: Segmentation, fitted: FittedRegions, fitOpts: { sigma: number; maxStops: number; radial: boolean }): { fitted: FittedRegions; splitRegions: number } | null
+// La llama fitGradientRegions con el ajuste ya hecho; exportada solo para los tests, que le pasan segmentaciones hechas a mano (un núcleo
+// verdadero mucho más disperso que el de ajuste, y un k-means que deja islas): ninguna muestra llega sola a esos dos casos.
 export function prepareGradient(img: RasterImage, resolved: ResolvedParams, info: SourceInfo, fit?: GradientFit): Prepared   // fit = fitGradientRegions(img, resolved, info)
 export function prepareForMode(img: RasterImage, resolved: ResolvedParams, info: SourceInfo): Prepared   // lines/flat/gradient; pixel lanza. trace() y el tuner la usan
 export function gradientFallbackWarning(reason: string | null): Warning
@@ -476,9 +493,18 @@ export async function trace(img: RasterImage, params: TraceParams, tracers: Reco
 //        (regiones crudas) > MAX_GRADIENT_REGIONS: fallback con "la imagen se divide en N regiones (el límite es 2 000)" → selectModel por región (maxStops, radial = radialGradients) sobre su núcleo y, si el núcleo es
 //        < GRADIENT_FIT_MIN_CORE_SHARE de núcleo ∪ banda profunda, también sobre esa unión (gana según GRADIENT_FIT_CORE_TOLERANCE) → hasta
 //        GRADIENT_MERGE_ROUNDS rondas de planMerges(proxy, seg con el núcleo de ajuste, models, { sigma, pixels, maxStops, radial }) →
-//        mergeRegions → reajuste de las regiones nuevas que agrupan más de una (las demás conservan su modelo). splitComplex no existe: una
-//        región complex se pinta con su mejor candidato; si las complex superan GRADIENT_MAX_COMPLEX_SHARE del área etiquetada (tras el primer
-//        ajuste, sin rondas de fusión, y otra vez tras ellas): fallback con "el N % de la imagen no se explica con colores planos ni degradados".
+//        mergeRegions → reajuste de las regiones nuevas que agrupan más de una (las demás conservan su modelo). Si las complex superan
+//        GRADIENT_MAX_COMPLEX_SHARE del área etiquetada (tras el primer ajuste, sin rondas de fusión, y otra vez tras ellas): fallback con
+//        "el N % de la imagen no se explica con colores planos ni degradados" → por debajo de ese límite, las complex que queden se parten
+//        (splitComplexRegions): splitComplex sobre el núcleo de ajuste de cada una, por área descendente (id como desempate) y mientras las
+//        regiones que añade quepan en el presupuesto GRADIENT_SPLIT_MAX_NEW_SHARE y en MAX_GRADIENT_REGIONS; la parte 0 conserva el id y las
+//        demás reciben ids nuevos al final; los píxeles de la región que no son núcleo (la banda) van a la parte cuyo relleno los predice mejor
+//        (el criterio de refineLabels); GRADIENT_SPLIT_SMOOTH_PASSES pasadas de mayoría por 8 vecinos dentro de la región alisan las dos
+//        fronteras (si una parte quedaría con menos de MIN_MODEL_CORE píxeles del núcleo de ajuste, esa región vuelve a sus etiquetas sin
+//        alisar) y absorbIslands absorbe todo trozo 4-conexo de una parte por debajo de GRADIENT_SPLIT_MIN_ISLAND px que toque un trozo mayor de
+//        otra parte de la misma región; última puerta, sobre las etiquetas finales: cada parte necesita MIN_MODEL_CORE píxeles del núcleo
+//        VERDADERO (el que ajusta fitRegionModels), y si no, esa región no se parte. Se reconstruyen area y regionAdjacency y las partes se
+//        ajustan como las regiones de una ronda de fusión (fitRegionModels). Una parte que sigue siendo complex se pinta con su mejor candidato.
 //        Por último cada degradado pasa por extendGradient sobre la banda
 //        profunda de su región (su rango de paradas llega al contorno y no se queda donde acaba el núcleo) y rmse se recalcula sobre el núcleo.
 //        prepareGradient: fallback → prepareFlat(img, { ...resolved, mode: 'flat', colors: 16, exactPalette: false }, info) +
@@ -1866,6 +1892,167 @@ Aclaraciones tomadas al implementar (los módulos las cumplen y los tests las fi
     pajaro                      4001x4001  gradient  1    4672      33     47     831   0.103  0.107     36887  0.998  0.999  0.996    0.1  0.004  large-input
     splash                        740x740  flat      2     453      16   2675   36945   0.058  0.068   1268085  0.897  0.950  0.818    2.6  0.182  baked-checkerboard,photo
     ```
+
+- Degradados, división de regiones complejas (`src/core/fillModel.ts` splitComplex, `src/core/pipeline.ts` splitComplexRegions y smoothParts,
+  `tests/core/fillModel.test.ts`, `tests/pipeline/gradientSplit.test.ts` nuevo, `tests/bench/realImages.test.ts`), 2026-09-11. El vientre oscuro
+  de pajaro era la única región grande que ningún degradado de un solo eje explicaba. Medidas de partida (proxy f = 3, 1334², σ̂ 0.019, 58
+  regiones crudas y 33 tras una ronda de fusiones): región 25, núcleo 19 967 px (1.2 % del núcleo), caja (586,829)-(899,1026) = 314×198, lineal
+  de 4 paradas a 76°, rmse 8.81 frente a 14.33 del plano. Con maxStops 4, 8, 16 y 32 el Douglas-Peucker converge a las MISMAS 4 paradas y al
+  mismo 8.81, y el radial va de 10.91 (2 paradas) a 9.05 (6 paradas): el problema no es el número de paradas. `fitPlane` da 4.03, menos de la
+  mitad, así que los gradientes de los tres canales no son colineales ahí y ningún degradado SVG de un eje puede expresarlo; la respuesta
+  expresable en SVG es partir la región.
+  · k-means determinista, k = 2, sobre (x, y, residuo de luma con signo del relleno actual), los tres rasgos escalados a [0, 1] (x e y por la
+    caja de la región, el residuo por su rango) para que la geometría y el error de color pesen igual; semillas = los píxeles de residuo máximo
+    y mínimo (empate: el índice menor), `SPLIT_KMEANS_ITERATIONS` 12 pasadas y parada en cuanto ningún píxel cambia de grupo. Cada parte se
+    ajusta con selectModel, así que puede salir sólida, lineal o radial.
+  · Un nivel se acepta solo si las dos partes tienen ≥ `MIN_MODEL_CORE` 64 px de núcleo Y el RMSE ponderado por núcleo baja a
+    ≤ `SPLIT_MAX_RMSE_RATIO` 0.8 del de la región (20 % relativo) Y al menos `SPLIT_MIN_RMSE_GAIN` 1.5 niveles en absoluto. Las dos cotas
+    juntas, no una u otra: la relativa sola aceptaría 0.5 → 0.3 en una región ya buena (partir el ruido) y la absoluta sola aceptaría 40 → 38.5
+    en una que seguirá estando mal. Medido: el vientre 8.81 → 3.85 pasa (56 % y 4.96 niveles); la región 11 de pajaro (sólida, núcleo 1934 px,
+    rmse 4.45 igual a su plano, ruido sin estructura) devuelve null en las tres profundidades, que es lo que debe hacer.
+  · `SPLIT_MAX_DEPTH` 2, elegida midiendo el vientre (una parte que la escalera sigue llamando complex se vuelve a partir):
+    ```
+    maxDepth  partes  rmse por parte      ponderado por núcleo
+    -         1       8.81                8.81
+    1         2       4.51 / 2.93         3.85
+    2         3       1.63 / 2.73 / 2.93  2.61
+    3         3       iguales que con 2   2.61
+    ```
+    Con 3 no cambia nada (la parte de 2.93 intenta otro nivel y no gana el margen), así que 2 es la menor profundidad que deja de mejorar.
+    Honestamente: dos de las tres partes siguen por encima de T_LIN = max(2.5, 2σ̂) = 2.5 (2.74 y 2.92 tras el reajuste), así que el vientre NO
+    queda entero bajo el umbral de la escalera. Lo que sí baja es el error real: 8.81 → 2.61 ponderado, y el peor RMSE interior del SVG 8.84 →
+    2.83.
+  · Cableado en fitGradientRegions: después de las fusiones y DESPUÉS del fallback por complejas. El orden importa: una imagen que es casi toda
+    compleja no es arte plano y partirla no la convierte en eso (splash con el 64 % del área en complejas e Instagram con el 70.7 %, forzados a
+    gradient, siguen cayendo al fallback sin ejecutar ni un k-means). Se parten por área descendente (id como desempate) y mientras la cuenta de
+    regiones quepa en `MAX_GRADIENT_REGIONS`; la parte 0 conserva el id de la región y las demás reciben ids nuevos al final.
+  · La división cubre TODOS los píxeles de la región, núcleo y banda: el k-means solo ve el núcleo de ajuste, y cada píxel de la banda va a la
+    parte cuyo relleno lo predice mejor (error RGB al cuadrado), el mismo criterio que usa `refineLabels` a U×, para que las etiquetas del proxy
+    y el refinado a U× no se contradigan en la costura; repartiendo por parte más cercana, un píxel de banda podía caer en una parte cuya rampa
+    no llega hasta él. Después se reconstruyen `area` y `regionAdjacency` para las etiquetas nuevas; `core`, `edge`, σ̂ y edgeShare no cambian (el
+    núcleo es por píxel, así que un píxel de núcleo de la región vieja lo es de la parte que lo tome, y cada parte conserva ≥ 64). Las partes se
+    ajustan como las regiones que crea una ronda de fusión (fitRegionModels con los modelos de las demás intactos), así que su modelo sale de su
+    conjunto final de píxeles y la regla de banda profunda también se les aplica.
+  · `GRADIENT_SPLIT_SMOOTH_PASSES` 4 (smoothParts): el k-means decide por píxel sobre un residuo, y en la banda decide la comparación de
+    rellenos, así que las dos fronteras salen dentadas y el trazador paga un nodo por cada onda. Cada pasada mueve un píxel a la parte a la que
+    pertenece la mayoría ESTRICTA de sus 8 vecinos dentro de la misma región, leyendo de una copia de la pasada anterior para no depender del
+    orden de barrido (empate: se queda donde está). Si a una parte le quedaran menos de 64 píxeles de núcleo, esa región vuelve a sus etiquetas
+    sin alisar. Medido en pajaro con el absorbido de islas ya activo, con fidelidad 0.9994 (cutout) y 0.9986 (stacked) y RMSE de tinta 1.084 en
+    las cuatro variantes, y en las DOS formas de capas, porque la revisión señaló que la constante se había elegido solo con cifras de cutout:
+    ```
+    pasadas  cutout nodos/bytes   stacked nodos/bytes
+    0        1257 / 52 595        5870 / 215 066
+    2        1177 / 49 858        5412 / 196 790
+    4        1175 / 50 328        5287 / 193 239
+    6        1172 / 50 241        5276 / 193 130
+    ```
+    En cutout las pasadas dejan de importar a partir de 2 (de 2 a 4 son 2 nodos menos y 470 bytes más); en stacked 4 sigue siendo el codo (de 2 a
+    4 ahorra 125 nodos y 3 551 bytes, de 4 a 6 solo 11 nodos). Se mantiene 4 porque el caso que más paga es stacked. La tabla de la primera
+    versión (0 → 2553 nodos, 4 → 1458) se midió sin absorbIslands, que ya quita casi todo lo que el alisado quitaba.
+  · `GRADIENT_SPLIT_MIN_ISLAND` = `MIN_MODEL_CORE` 64 px del proxy (absorbIslands), hallazgo de la revisión: el alisado por mayoría solo cuenta
+    vecinos de la MISMA región original, así que un trozo pegado al contorno de la región no tiene votantes y sobrevive a todas las pasadas, y
+    nada hacía limpieza por componentes conexas. Medido: el vientre de pajaro era UNA región de 21 856 px del proxy y sus tres partes salían en
+    8 + 1 + 2 trozos (5562, 25, 19, 16, 8, 8, 7, 2 | 5895 | 10307, 7), es decir 9 islas; a f = 3 una isla de 2 px del proxy son ~18 px a 1x, muy
+    por encima del turdsize escalado (2 px² a U = 1), así que potrace emitía un subcamino por isla pintado con el degradado de otra parte. Con
+    `bakedBackground: 'keep'`, splash daba 1574+18+1 y 3077+186+61+53+47+12. absorbIslands recorre los trozos 4-conexos de cada parte y mueve todo
+    el que baje de 64 px a la parte de la mayoría de sus vecinos de 4 dentro de la región (empate: el índice de parte menor), en rondas que solo
+    cuentan vecinos de trozos que NO se mueven (así dos islas no pueden intercambiarse de parte) y que se repiten mientras algo se mueva; un trozo
+    sin vecino mayor de otra parte se queda donde está, porque la región ya está partida ahí y eso la segmentación misma lo produce (splash tiene
+    30 regiones con varios trozos sin que el split intervenga). El umbral: la isla más grande medida es de 25 px y el trozo más pequeño que es una
+    parte de verdad es de 169 px (fixture shadingGrid) y 186 px (el segundo trozo de la región 598 de splash), así que 64 cae en mitad de ese
+    hueco, y por debajo de `MIN_MODEL_CORE` un trozo no podría sostener un modelo propio de todos modos. Sin coste de fidelidad y con una rebaja
+    clara de tamaño, medido en pajaro (fidelidad 0.9994, MAE 0.08 y pct16 0.0011 con los cuatro umbrales):
+    ```
+    umbral        trozos de las tres partes          nodos  bytes
+    sin absorber  5562,25,19,16,8,8,7,2|5895|10307,7  1458  61 799
+    16            5569,25,19,16 | 5897 | 10330        1344  57 147
+    32            5569 | 5922 | 10365                 1175  50 328
+    64 (elegido)  5569 | 5922 | 10365                 1175  50 328
+    ```
+  · `GRADIENT_SPLIT_MAX_NEW_SHARE` 0.25 (presupuesto de regiones), hallazgo de la revisión: el único techo era MAX_GRADIENT_REGIONS (2 000) y
+    `GRADIENT_MAX_COMPLEX_SHARE` se evalúa ANTES de partir, así que una imagen con muchas regiones de sombreado 2-D multiplicaba su cuenta de
+    regiones por hasta 2^SPLIT_MAX_DEPTH = 4, y cada región nueva es otra capa, otra máscara, otra llamada a potrace y otro <linearGradient>.
+    Fixture shadingGrid (288², 36 sombreados 2-D independientes de 24×24 sobre blanco, el 25 % del lienzo, por debajo del límite de complejas):
+    ```
+    variante             regiones  split  nodos   bytes   fidelidad  ajuste  trace
+    sin partir (HEAD)    37        0        548   22 518  0.9453      82 ms   398 ms
+    sin presupuesto      145       36      3838  155 785  0.9902     447 ms  1236 ms
+    presupuesto 0.25     46        3        797   30 645  0.9459     369 ms   677 ms
+    ```
+    El split puede añadir como máximo max(2^SPLIT_MAX_DEPTH − 1, ceil(0.25·regiones)) regiones y se gastan por área descendente, que es donde
+    está el error; una región cuyas partes no caben en lo que queda del presupuesto se salta, y una posterior más pequeña todavía puede entrar.
+    El suelo 2^SPLIT_MAX_DEPTH − 1 = 3 garantiza que una sola región siempre se puede partir hasta el fondo (crossShading, 5 regiones, lo
+    necesita). Con 0.25 el peor caso medido crece un 45 % en nodos y un 36 % en bytes, el mismo orden que el +41 % / +36 % que paga pajaro, en
+    lugar de 7×. Lo que se renuncia es explícito: en una imagen de N sombreados igual de importantes solo se arreglan los mayores (3 de 36 aquí:
+    fidelidad 0.9453 → 0.9459 en vez de 0.9902). No avisa al usuario: `splitRegions` lo cuenta en GradientFit y un sombreado que no se parte se
+    pinta como antes de que splitComplex existiera.
+  · Puerta del núcleo verdadero (hallazgo de la revisión): los 64 px de `MIN_MODEL_CORE` que garantizan splitComplex y smoothParts se cuentan
+    sobre el núcleo de AJUSTE (núcleo ∪ banda profunda), pero la Segmentation nueva lleva el núcleo VERDADERO y fitRegionModels vuelve a ajustar
+    cada parte sobre él: una parte hecha casi solo de banda podía volver con coreCount < 64 (el suelo sólido de la escalera, split desperdiciado)
+    o con coreCount 0, donde `fitFlat(n = 0)` devuelve [0, 0, 0] con rmse 0 y complex false, es decir un relleno NEGRO que refineLabels pintaría
+    donde el 3×3 del proxy fuese uniforme. Reproducido en un test con una segmentación hecha a mano (núcleo verdadero de 100 px en una esquina,
+    núcleo de ajuste completo): sin la puerta la región se parte en 4 y TRES de las cuatro partes salen negras con coreCount 0. Ahora se cuentan
+    los píxeles del núcleo verdadero por parte sobre las etiquetas FINALES (después de alisar y absorber) y una región con una parte por debajo de
+    64 no se parte. Ninguna muestra cambia (ninguna llegaba al caso), pero la clase de entrada sí llega a splitComplex: en splash las regiones
+    complejas 591 (144 px de núcleo de ajuste), 593 (79) y 596 (73) son casi todo banda y solo las frenaba la regla de ganancia.
+  · pajaro antes y después (potrace, U 1, f 3, misma medida que el bench):
+    ```
+    medida                                antes (HEAD)               después
+    regiones (crudas → finales)           58 → 33                    58 → 35 (1 región partida en 3)
+    rmse de la región del vientre         8.81                       1.64 / 2.74 / 2.92 (2.606 ponderado)
+    trozos 4-conexos de esas partes       1 (una sola región)        1 / 1 / 1 (5569 | 5922 | 10365 px)
+    peor RMSE interior de capa            8.84                       2.81
+    capas por encima de 2.5               1                          2 (2.81 y 2.68; la tercera parte 1.53)
+    RMSE de tinta ponderado por núcleo    2.833 (plano 22.37)        1.084 (plano 22.20)
+    núcleo de tinta con rmse ≤ 2.5        89.4 %                     91.8 %
+    área en regiones complejas            1.39 %                     1.08 %
+    capas / <linearGradient>              33 / 19                    35 / 21
+    nodos / bytes (cutout, por defecto)   831 / 36 887               1175 / 50 328   (+41 % / +36 %)
+    nodos / bytes (stacked)               3869 / 144 366             5287 / 193 239  (+37 % / +34 %)
+    fidelidad / SSIM / IoU                0.9982 / 0.9995 / 0.9963   0.9994 / 0.9997 / 0.9989
+    fidelidad stacked                     0.9975                     0.9986
+    MAE / pct16                           0.12 / 0.0037              0.08 / 0.0011
+    fitGradientRegions                    1015 ms                    1273-1475 ms
+    trace() (fila del bench)              4672 ms                    4343 ms
+    arrayBuffers tras el ajuste / maxRSS  155 MB / 386 MB            179 MB / 388 MB
+    ```
+    Las cifras de stacked de la columna "antes" son las que midió la revisión sobre HEAD; las demás se midieron aquí. El coste está en el SVG:
+    +344 nodos y +13 441 bytes en cutout, que es la forma de capas por defecto de gradient, y +1418 nodos y +48 873 bytes en stacked, donde cada
+    máscara es {rank ≥ j} y dos capas más engordan toda la pila (la revisión lo señaló: el coste solo estaba medido para cutout). Dos de las tres
+    formas del vientre tienen frontera libre (el corte no sigue ningún contorno del dibujo) y el alisado más el absorbido de islas la ordenan pero
+    no la convierten en una curva del trazo. El beneficio es el error local: donde había una mancha plana con 8.8 niveles de error, ninguna capa
+    pasa ya de 2.81. Antes de absorber las islas el mismo SVG pesaba 1458 nodos y 61 799 bytes (stacked 7261 y 272 054), con la misma fidelidad.
+  · Guardas medidas (corregidas tras la revisión, que encontró esta nota optimista). Ninguna otra muestra del bench cambia una cifra de
+    fidelidad o IoU (GENTERA 0.999/0.999, Instagram 0.940/0.862, clip_art 0.960/0.910, eagle 0.900/0.776, avatar 0.995/0.988, splash
+    0.897/0.818) y en todas `splitRegions` es 0, pero NO por la misma razón: Instagram, clip_art, eagle y splash caen al fallback (por borde o por
+    complejas) y ahí no se ejecuta ningún k-means, mientras que GENTERA y avatar sí se ajustan en gradient; GENTERA sale con 6 regiones y ninguna
+    compleja, y avatar con 35 regiones y una compleja de 91 px de núcleo, por debajo de 2·`MIN_MODEL_CORE` = 128, así que splitComplex devuelve
+    null antes de cualquier k-means. El fallback por complejas sigue yendo ANTES del split a propósito: splash (64 % del área en complejas) e
+    Instagram (70.7 %) forzados a gradient caen igual. Lo que no es cierto es que splash no se parta nunca: con `bakedBackground: 'keep'`, que es
+    un parámetro del usuario, no cae al fallback (599 regiones, 26 complejas) y parte 1 región, la que dejaba las islas de arriba; su ajuste tarda
+    30 s con y sin split (1065 regiones crudas a f = 1, coste anterior a este trabajo). Tiempos del bench: clip_art 113 ms, eagle 387, Instagram
+    1052, GENTERA 1117, avatar 280, splash 517. gradientFeathers(256), radialDisc(128), diagonalSweep(128) y flatShapes3(96) dan `splitRegions` 0,
+    fijado en un test, y sus salidas no cambian; aaCircle, sprite32 y transparentLogo tampoco. No hizo falta tocar `GRADIENT_MAX_COMPLEX_SHARE`.
+  · Tests. `splitComplex`: una región con dos sombreados que se anulan (la mitad de arriba sube en +x y la de abajo vuelve en −x, medias
+    iguales) no tiene eje que ajustar, así que su mejor relleno es un color plano de rmse 39.62, y el split devuelve 4 partes puras (cada una
+    entera dentro de una mitad) de rmse 0.28; devuelve null en una rampa limpia (hueRamp), en arte plano (flatShapes3) y con menos de 2·64 px de
+    núcleo. Límite registrado en un test, no un objetivo: una costura VERTICAL con mitades que suben en x y en y NO se parte (null), porque las
+    dos mitades caen en tramos disjuntos del parámetro de la rampa ajustada y sus paradas siguen a cada una, de modo que lo único sin explicar es
+    la variación perpendicular y ningún corte atravesando el eje separa las mitades; el corte siempre cruza el eje ajustado, que es justo lo que
+    el vientre necesita. `tests/pipeline/gradientSplit.test.ts`: un cuadrado con R en x, G en y y B contra las dos (una región sin escalones, un
+    cuarto del lienzo para quedar por debajo del límite de complejas) se parte y se traza, dos ajustes dan exactamente las mismas etiquetas y
+    rellenos, las cuatro fixtures de degradado no se tocan, y con BENCH=1 el vientre de pajaro cumple las cifras de arriba y dos trazados salen
+    idénticos byte a byte. Bench: `PAJARO_COMPLEX_RMSE` 8.9 → 2.9 (el peor RMSE interior baja 3.1×) y las capas por encima de 2.5 pasan de 1 a
+    `PAJARO_LAYERS_OVER_TARGET` 2 porque el vientre son tres formas; el tope de `<linearGradient>` pasa de ceil(1.1·18) = 20 a
+    18 + `PAJARO_BELLY_PARTS` 3 = 21.
+  · Tests añadidos al corregir la revisión, en `tests/pipeline/gradientSplit.test.ts` y con `splitComplexRegions` exportada para ellos (ninguna
+    muestra llega sola a estos dos casos): shadedInset es un sombreado 2-D dentro de un rectángulo de 112×80 con 6 bloques de 5×5 px de BANDA
+    pegados a su borde izquierdo y pintados con el color del punto espejado, de modo que la parte que mejor los predice nunca es la de alrededor y
+    el alisado no los alcanza (no tienen votantes); sin absorbIslands quedan cinco trozos de 23 px y con él cada parte es un solo trozo, y el test
+    también comprueba que no sobrevive ningún trozo por debajo de `GRADIENT_SPLIT_MIN_ISLAND`. shadingGrid fija el presupuesto (46 regiones, 3
+    partidas, ≤ 900 nodos y ≤ 35 000 bytes; sin presupuesto son 36 partidas y 3838 nodos). La puerta del núcleo verdadero se fija con la misma
+    imagen en dos variantes: núcleo verdadero completo (se parte y cada región nueva conserva ≥ 64 px de núcleo verdadero y coreCount > 0) y
+    núcleo verdadero de 100 px en una esquina (null). Y en BENCH, las tres partes del vientre de pajaro son un solo trozo 4-conexo cada una.
 
 ## Worker
 `src/workers/protocol.ts` (mensajes), `handler.ts` (lógica pura y testeable en Node), `trace.worker.ts` (envoltorio fino:

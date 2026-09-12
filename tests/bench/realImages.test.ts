@@ -61,6 +61,13 @@ const PAJARO_MIN_GAIN = 0.017;
  */
 const PAJARO_GRADIENT_SHAPES = 18;
 /**
+ * The dark belly is a 2-D shading that no single gradient expresses (fitPlane 4.03 against 8.81 for the best ramp):
+ * splitComplex breaks it into 3 parts, each painted with its own linear gradient, so the 18 shapes now take 21
+ * <linearGradient> instead of 19 (the swoosh's two pieces plus 2 extra parts of the belly). See ARCHITECTURE.md,
+ * "Degradados, división de regiones complejas".
+ */
+const PAJARO_BELLY_PARTS = 3;
+/**
  * PAJARO_GRADIENT_SHAPES, 12 navy shadows, the background and the 1-px black frame around the image (row 0 of the user's
  * img/pajaro.jpg is black too). The trace: 33 layers = background, 12 navy, 19 gradients and the frame. Before the review
  * fixes the frame was painted #fefefe and a solid piece cut the tip off a green feather.
@@ -69,10 +76,13 @@ const PAJARO_SHAPES = 32;
 /** The plan's quality target for the core of a region (JPEG): interior RMSE < 2.5 levels. */
 const PAJARO_REGION_RMSE = 2.5;
 /**
- * The dark belly (4-stop linear, the one complex region: a 2-D shading no linear or radial gradient explains, splitComplex
- * is not implemented) is the only layer over PAJARO_REGION_RMSE: interior RMSE measured 8.84, p99 26.
+ * The dark belly is a 2-D shading no linear or radial gradient explains. splitComplex now breaks it into 3 parts, so
+ * the single layer that measured interior RMSE 8.84 (p99 26) became three layers measuring 2.83, 2.69 and 1.53: the
+ * worst local miss of the whole image drops 3.1x, and the layers above PAJARO_REGION_RMSE go from 1 to 2 because the
+ * belly is three shapes now. Both numbers below are the measured ones.
  */
-const PAJARO_COMPLEX_RMSE = 8.9;
+const PAJARO_COMPLEX_RMSE = 2.9;
+const PAJARO_LAYERS_OVER_TARGET = 2;
 
 /** Per layer: the RMSE (pooled over R, G, B) of the pixels it paints at least `r` px from any other layer or none. */
 function interiorRmseByLayer(parsed: ParsedSvg, original: RasterImage, rendered: RasterImage, r: number): Array<{ n: number; rmse: number }> {
@@ -357,7 +367,7 @@ describe.skipIf(process.env.BENCH !== '1')('bench: real images (potrace)', () =>
     expect(pajaro.fidelity).toBeGreaterThanOrEqual(0.97);
     expect(pajaro.fidelity).toBeGreaterThanOrEqual(PAJARO_FLAT_FIDELITY + PAJARO_MIN_GAIN);
     expect(countMatches(pajaro.result.svg, /<linearGradient\b/g)).toBeGreaterThanOrEqual(Math.ceil(0.9 * PAJARO_GRADIENT_SHAPES));
-    expect(countMatches(pajaro.result.svg, /<linearGradient\b/g)).toBeLessThanOrEqual(Math.ceil(1.1 * PAJARO_GRADIENT_SHAPES));
+    expect(countMatches(pajaro.result.svg, /<linearGradient\b/g)).toBeLessThanOrEqual(PAJARO_GRADIENT_SHAPES + PAJARO_BELLY_PARTS);
     expect(pajaro.layers).toBeLessThanOrEqual(1.5 * PAJARO_SHAPES);
     // What global fidelity cannot see. The 1-px black frame: every ring pixel within 40 levels of the source.
     {
@@ -388,7 +398,7 @@ describe.skipIf(process.env.BENCH !== '1')('bench: real images (potrace)', () =>
       const byLayer = interiorRmseByLayer(parsedPajaro, pajaro.original, pajaro.rendered, 4);
       const over = byLayer.map((v, k) => ({ ...v, k })).filter((v) => v.n > 0 && v.rmse > PAJARO_REGION_RMSE);
       console.info(`   pajaro interior RMSE by layer: ${byLayer.map((v) => v.rmse.toFixed(2)).join(' ')}`);
-      expect(over.length).toBeLessThanOrEqual(1);
+      expect(over.length).toBeLessThanOrEqual(PAJARO_LAYERS_OVER_TARGET);
       for (const v of over) expect(v.rmse, `layer ${v.k}`).toBeLessThanOrEqual(PAJARO_COMPLEX_RMSE);
       // A gradient whose stops hold two colours (within 3 levels) has exactly two stops.
       for (const layer of parsedPajaro.layers) {
