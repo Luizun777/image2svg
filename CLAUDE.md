@@ -5,7 +5,7 @@ Vectorizador raster → SVG 100 % en el navegador que elimina los "picos" (reesc
 ## Stack
 - Vite 8 + TypeScript 6 vanilla, vitest 5, Node 26, **npm** (pnpm roto por corepack).
 - Motores: `esm-potrace-wasm` (GPL-2.0, principal) y `vtracer-web` (MIT). Proyecto GPL-2.0.
-- Deploy: GitHub Pages bajo `/image2svg/` con `.github/workflows/deploy.yml`.
+- Deploy: Vercel (image2svg-ashy.vercel.app), que compila con `vercel.json` en la raíz del dominio y se actualiza con cada push a `main`; `.github/workflows/ci.yml` solo verifica (typecheck, tests, build).
 
 ## Comandos
 - `npm run dev` → http://localhost:5173/image2svg/ (`?synth=circle|line|glyph|flat|sprite|logo|gradient|radial` solo en dev)

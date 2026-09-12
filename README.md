@@ -1,18 +1,27 @@
 # image2svg
 
-[![Despliegue](https://github.com/Luizun777/image2svg/actions/workflows/deploy.yml/badge.svg)](https://github.com/Luizun777/image2svg/actions/workflows/deploy.yml)
+[![CI](https://github.com/Luizun777/image2svg/actions/workflows/ci.yml/badge.svg)](https://github.com/Luizun777/image2svg/actions/workflows/ci.yml)
 [![Licencia: GPL-2.0](https://img.shields.io/github/license/Luizun777/image2svg)](LICENSE)
 
 Vectoriza imágenes raster (PNG, JPG, WebP, GIF o BMP) a SVG en el navegador y mide la fidelidad del resultado; la imagen
 no sale de tu equipo.
 
-**Demo:** [luizun777.github.io/image2svg](https://luizun777.github.io/image2svg/)
+**Demo:** [image2svg-ashy.vercel.app](https://image2svg-ashy.vercel.app/)
+
+![Interfaz de image2svg: controles, comparación lado a lado y panel de fidelidad](docs/captura.png)
 
 Los "picos" (dientes de sierra) aparecen cuando el trazador sigue tal cual la escalera de píxeles del
 borde. image2svg la elimina antes de trazar: reescala la imagen hasta 4× con un bicúbico sin sobreimpulso, la suaviza con un
 desenfoque gaussiano proporcional al reescalado y la binariza en el nivel del 50 % de cobertura, así Potrace recibe un borde
 continuo en lugar de escalones (la receta de `mkbitmap`). Después renderiza el SVG, lo compara con el original (SSIM, IoU,
 píxeles distintos) y muestra un mapa de diferencias.
+
+## De imagen a SVG
+
+![Comparación entre el PNG original y el SVG generado, con un detalle al 6×](docs/comparacion.png)
+
+Ese logo pasa de un PNG de 4001 × 4001 px y 1,5 MB a un SVG de 49 KB con 35 formas y 21 degradados lineales, con una
+fidelidad medida del 99,9 %. En el detalle al 6× cada pluma conserva su degradado en lugar de partirse en bandas de color.
 
 ## Modos
 
@@ -102,25 +111,17 @@ visual, en `DESIGN.md`.
 
 ## Despliegue
 
-### GitHub Pages (producción)
+El demo está en Vercel: [image2svg-ashy.vercel.app](https://image2svg-ashy.vercel.app/). Se actualiza con cada push a
+`main`.
 
-1. Publica el repositorio en GitHub con el nombre `image2svg`. La app se sirve bajo `/image2svg/`; si el repositorio se llama
-   de otra forma, cambia `base` en `vite.config.ts`.
-2. En **Settings → Pages → Build and deployment**, elige **Source: GitHub Actions**.
-3. Cada push a `main` ejecuta `.github/workflows/deploy.yml` (`npm ci`, `npm test`, `npm run build`) y publica `dist/`.
-   También se puede lanzar a mano desde la pestaña **Actions** (workflow_dispatch).
-
-La página queda en `https://<usuario>.github.io/image2svg/`.
-
-### Vercel (vista previa opcional)
-
-`vercel.json` fuerza `vite build --base=/`, porque Vercel sirve desde la raíz del dominio en vez de `/image2svg/`. No
-afecta al despliegue en GitHub Pages.
+`vercel.json` compila con `vite build --base=/`, porque Vercel sirve desde la raíz del dominio, mientras que
+`vite.config.ts` mantiene `base: '/image2svg/'` para servir la app bajo una subruta. Para desplegar a mano:
 
 ```bash
-npx vercel deploy --temporary --yes   # vista previa anónima, caduca en 60 min si no se reclama
-npx vercel login && npx vercel --prod # despliegue permanente en tu cuenta
+npx vercel login && npx vercel --prod
 ```
+
+Cada push a `main` ejecuta `.github/workflows/ci.yml` (`npm ci`, `npm run typecheck`, `npm test`, `npm run build`).
 
 ## Licencias
 

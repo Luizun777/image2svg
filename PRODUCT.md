@@ -8,7 +8,7 @@ web
 
 ## Stack
 
-Vite 8 + TypeScript vanilla + CSS propio (sin framework de UI ni librerías de animación). Todo el procesamiento corre en el navegador (Web Workers + WASM). Se despliega como sitio estático en GitHub Pages bajo `/image2svg/`. Decidido por el usuario.
+Vite 8 + TypeScript vanilla + CSS propio (sin framework de UI ni librerías de animación). Todo el procesamiento corre en el navegador (Web Workers + WASM). Se despliega como sitio estático en Vercel (image2svg-ashy.vercel.app). Decidido por el usuario.
 
 ## Users
 
